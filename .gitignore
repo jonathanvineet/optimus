@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+maps/
+autobot_mapping/secrets.h
