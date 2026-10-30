@@ -7,6 +7,7 @@ An ESP32 differential-drive robot. You drive it with the phone controller, and a
 |---|---|
 | `autobot_mapping/autobot_mapping.ino` | ESP32 firmware: the phone controller (unchanged UI and behaviour), gyro yaw, background ultrasonic, `/api/telemetry` |
 | `mac_mapper.py` | Mac live mapper (read-only: it never drives the motors) |
+| `viewer/` | USB live sensor viewer: 3D robot that follows the IMU, ultrasonic beam and echo radar (§4c) |
 | `requirements.txt` | Python dependencies (numpy, matplotlib, requests) |
 | `sketch_oct27b/`, `sketch_oct27a/` | Earlier controller-only sketches, kept for reference |
 
@@ -61,14 +62,14 @@ CLI="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/
    ```bash
    "$CLI" upload --fqbn esp32:esp32:d1_uno32 -p /dev/cu.usbserial-XXXX autobot_mapping
    ```
-2. Open the Serial Monitor at **115200 baud**. **Keep the robot still for the first ~3 s**
+2. Open the Serial Monitor at **921600 baud** (115200 before v1.6). **Keep the robot still for the first ~3 s**
    while the gyro calibrates.
 
 Expected output (the numbers will differ):
 
 ```
 =========================================
-AUTOBOT autobot_mapping-1.5 booting (reset reason: power_on)
+AUTOBOT autobot_mapping-1.6 booting (reset reason: power_on)
 Keep the robot STILL for gyro calibration.
 =========================================
 [IMU] MPU6050 found (WHO_AM_I=0x68)
@@ -115,6 +116,42 @@ reconnect by themselves.
 * To go back to the BotController network, empty `HOME_WIFI_SSID` in `secrets.h`. Then use
   `http://192.168.4.1` again.
 
+### 4c. Live sensor viewer over USB (since v1.6)
+
+`viewer/` shows the robot in 3D, turning and tilting with the MPU6050, with the HC-SR04 beam
+drawn from the front of the robot to the obstacle it hits. Every echo is left behind as a
+fading point in world space, so **spinning the robot in place sweeps out the room** (3D and the
+2D radar on the right). Data comes over the USB cable at 100 Hz; the newest sample is drawn on
+every screen refresh with no smoothing, so the delay is about 10–25 ms.
+
+```bash
+cd ~/elco/optimus
+python3 -m http.server 8000 -d viewer
+```
+
+1. Plug the robot into the Mac with USB. **Close the Arduino Serial Monitor** (only one program
+   can hold the port).
+2. Open **http://localhost:8000** in **Chrome or Edge** (Safari and Firefox have no Web Serial).
+3. Click **Connect USB** and pick the `usbserial` port. The viewer sends `@stream 1`, the robot
+   starts streaming, and the console at the bottom shows its normal log lines. If the board
+   resets on connect, keep it still ~3 s while the gyro calibrates (a banner says so).
+4. **Setup** card: tell it which way the MPU6050's printed **X** arrow points on the robot and
+   whether the chip faces up. Check by tilting the nose up: PITCH should go positive and the
+   model's nose should rise. The red/green/blue arrows on the model show the chip's X/Y/Z.
+5. **Zero heading** makes the current direction 0° (and clears echoes). **Calibrate gyro**
+   re-measures the bias (motors stopped, robot still, ~2 s). **Demo** runs a simulated robot
+   when the real one is not plugged in (`http://localhost:8000/?demo`).
+
+Notes:
+* The phone controller keeps working over Wi-Fi while the USB viewer runs.
+* Three.js is in `viewer/vendor/`, so the viewer works with no internet (e.g. on BotController).
+* Heading drifts slowly, as `yaw_deg` does (no magnetometer). Roll and pitch do not drift: the
+  accelerometer pulls them back to gravity whenever the robot is not accelerating hard.
+* The robot is drawn at a fixed spot; it rotates and tilts but does not move (no encoders). Echo
+  points are only correct while it turns in place. Use `mac_mapper.py` for driving maps.
+* The stream stops by itself 3 s after the viewer closes, so the Serial Monitor stays readable.
+  Serial commands (one per line): `@stream 1`, `@stream 0`, `@cal`.
+
 ## 5. Check telemetry in a browser
 
 On the Mac, open **http://192.168.4.1/api/telemetry**, or run:
@@ -128,7 +165,7 @@ You should see something like this (abridged):
 ```json
 { "millis": 51234, "mode": "manual", "distance_cm": 87.3, "distance_valid": true,
   "us_status": "ok", "imu_ok": true, "yaw_deg": 12.345, "gyro_z_dps": 0.0,
-  "gyro_z_raw_dps": -1.231, "gyro_bias_dps": -1.2345, "gyro_cal": "ok",
+  "roll_deg": 0.41, "pitch_deg": -1.12, "gyro_z_raw_dps": -1.231, "gyro_bias_dps": -1.2345, "gyro_cal": "ok",
   "left_cmd": 0, "right_cmd": 0, "left_cmd_int": 1234.5, "right_cmd_int": 1301.2, ... }
 ```
 

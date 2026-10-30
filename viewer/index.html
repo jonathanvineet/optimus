@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AUTOBOT Live Sensors</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #07090d;
+  --panel: #0e131a;
+  --panel-2: #131a23;
+  --line: #222c38;
+  --text: #dce5ed;
+  --muted: #7d8b99;
+  --dim: #4a5664;
+  --imu: #39c6ff;
+  --us: #ffb23e;
+  --ok: #3ddc84;
+  --warn: #ffb23e;
+  --bad: #ff4d5a;
+  --x: #ff5a5f;
+  --y: #4cd964;
+  --z: #4aa3ff;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+button, select, input { font: inherit; color: inherit; }
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+}
+
+/* ---------- top bar ---------- */
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  font-size: 14px;
+}
+.brand span { color: var(--imu); }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+.dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot.stale { background: var(--warn); }
+.dot.err { background: var(--bad); }
+
+.spacer { flex: 1; }
+
+.btn {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { border-color: #3a4757; }
+.btn.primary { background: #0f3b52; border-color: #1b6a90; color: #dff4ff; }
+.btn.primary:hover { background: #134b68; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+
+/* ---------- main ---------- */
+main {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  min-height: 0;
+}
+
+.stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+#three { position: absolute; inset: 0; }
+#three canvas { display: block; }
+
+.overlay-tl, .overlay-tr, .overlay-bl {
+  position: absolute;
+  pointer-events: none;
+}
+.overlay-tl { top: 12px; left: 12px; }
+.overlay-tr { top: 12px; right: 12px; pointer-events: auto; }
+.overlay-bl { bottom: 12px; left: 12px; }
+
+.hud {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 4px 18px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.72);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+.hud .k { color: var(--muted); font-size: 11px; letter-spacing: 0.08em; }
+.hud .v {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  min-width: 6.2ch;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(7, 9, 13, 0.72);
+}
+.seg button {
+  border: 0;
+  background: transparent;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.seg button.on { background: var(--panel-2); color: var(--text); }
+
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+  background: rgba(7, 9, 13, 0.6);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.range-label {
+  position: absolute;
+  transform: translate(-50%, -140%);
+  pointer-events: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(7, 9, 13, 0.8);
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.banner {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: rgba(60, 40, 0, 0.85);
+  border: 1px solid var(--warn);
+  color: #ffe2b0;
+  font-weight: 600;
+  display: none;
+}
+.banner.show { display: block; }
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.empty div {
+  max-width: 420px;
+  text-align: center;
+  color: var(--muted);
+  background: rgba(7, 9, 13, 0.75);
+  padding: 16px 20px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+}
+.empty b { color: var(--text); }
+.empty.hide { display: none; }
+
+/* ---------- side panel ---------- */
+aside {
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.card {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.card h2 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card h2 i {
+  width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+}
+
+.big {
+  font-family: var(--mono);
+  font-size: 40px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.big small { font-size: 16px; color: var(--muted); margin-left: 4px; }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.chip.ok { color: var(--ok); border-color: rgba(61, 220, 132, 0.4); }
+.chip.warn { color: var(--warn); border-color: rgba(255, 178, 62, 0.4); }
+.chip.bad { color: var(--bad); border-color: rgba(255, 77, 90, 0.4); }
+
+canvas.panel-canvas {
+  display: block;
+  width: 100%;
+  border-radius: 6px;
+  background: #0a0e13;
+  border: 1px solid var(--line);
+}
+
+.bars { display: grid; gap: 7px; margin-top: 4px; }
+.bar {
+  display: grid;
+  grid-template-columns: 22px 1fr 64px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.bar .lab { color: var(--muted); }
+.bar .val { text-align: right; font-variant-numeric: tabular-nums; }
+.track {
+  position: relative;
+  height: 8px;
+  background: #0a0e13;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.track::after {
+  content: "";
+  position: absolute;
+  left: 50%; top: 0; bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+.fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  width: 0;
+}
+
+.meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 10px;
+}
+.meta span:nth-child(odd) { color: var(--muted); }
+.meta span:nth-child(even) { text-align: right; }
+
+.controls { display: grid; gap: 10px; }
+.controls label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+}
+.controls select {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+details.console {
+  border-top: 1px solid var(--line);
+}
+details.console summary {
+  cursor: pointer;
+  padding: 10px 16px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  font-weight: 600;
+}
+#console {
+  margin: 0;
+  padding: 0 16px 14px;
+  height: 220px;
+  overflow-y: auto;
+  font: 11px/1.45 var(--mono);
+  color: #a9b6c3;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+@media (max-width: 900px) {
+  .app { height: auto; min-height: 100vh; }
+  main { grid-template-columns: 1fr; }
+  .stage { height: 60vh; }
+  aside { border-left: 0; border-top: 1px solid var(--line); }
+  .hud .v { font-size: 17px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">AUTOBOT <span>LIVE</span></div>
+    <div class="pill"><i class="dot" id="linkDot"></i><span id="linkText">offline</span></div>
+    <div class="pill" title="Telemetry frames per second / time since the last frame">
+      <span id="rateText">— Hz</span><span style="color:var(--dim)">·</span><span id="ageText">—</span>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn primary" id="connectBtn">Connect USB</button>
+    <button class="btn" id="demoBtn">Demo</button>
+    <button class="btn" id="disconnectBtn" disabled>Disconnect</button>
+  </header>
+
+  <main>
+    <section class="stage">
+      <div id="three"></div>
+      <div id="rangeLabel" class="range-label" style="display:none"></div>
+      <div class="banner" id="calBanner">Calibrating gyro — keep the robot still</div>
+
+      <div class="overlay-tl">
+        <div class="hud">
+          <span class="k">YAW</span><span class="k">PITCH</span><span class="k">ROLL</span>
+          <span class="v" id="hudYaw">—</span>
+          <span class="v" id="hudPitch">—</span>
+          <span class="v" id="hudRoll">—</span>
+        </div>
+      </div>
+
+      <div class="overlay-tr">
+        <div class="seg" id="viewSeg">
+          <button data-view="orbit" class="on">Orbit</button>
+          <button data-view="chase">Chase</button>
+          <button data-view="top">Top</button>
+        </div>
+      </div>
+
+      <div class="overlay-bl">
+        <span class="hint">Drag to orbit · scroll to zoom · right-drag to pan</span>
+      </div>
+
+      <div class="empty" id="emptyState">
+        <div>
+          <b>Plug the robot in over USB and press Connect USB.</b><br>
+          Pick the <code>usbserial</code> / CP210x / CH340 port. Chrome or Edge only.<br>
+          No robot handy? Press <b>Demo</b>.
+        </div>
+      </div>
+    </section>
+
+    <aside>
+      <div class="card">
+        <h2><i style="background:var(--us)"></i>ULTRASONIC · FRONT</h2>
+        <div class="row">
+          <div class="big" id="distBig">—<small>cm</small></div>
+          <span class="chip" id="usChip">no data</span>
+        </div>
+        <div style="height:10px"></div>
+        <canvas class="panel-canvas" id="radar" height="300"></canvas>
+        <div style="height:8px"></div>
+        <canvas class="panel-canvas" id="trend" height="90"></canvas>
+        <div class="meta">
+          <span>samples / s</span><span id="usRate">—</span>
+          <span>echo points</span><span id="echoCount">0</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><i style="background:var(--imu)"></i>IMU · MPU6050</h2>
+        <div class="bars" id="gyroBars"></div>
+        <div class="meta">
+          <span>|accel|</span><span id="accMag">—</span>
+          <span>gyro calibration</span><span id="calState">—</span>
+          <span>imu</span><span id="imuState">—</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><i style="background:var(--muted)"></i>DRIVE</h2>
+        <div class="bars" id="motorBars"></div>
+        <div class="meta">
+          <span>mode</span><span id="modeText">—</span>
+          <span>frames dropped (fw)</span><span id="dropText">—</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><i style="background:var(--muted)"></i>SETUP</h2>
+        <div class="controls">
+          <label>MPU6050 X axis points
+            <select id="mountFwd">
+              <option value="+x">forward</option>
+              <option value="-x">backward</option>
+              <option value="+y">left</option>
+              <option value="-y">right</option>
+            </select>
+          </label>
+          <label>MPU6050 chip side
+            <select id="mountFace">
+              <option value="up">up</option>
+              <option value="down">down</option>
+            </select>
+          </label>
+          <label>Show IMU axes on model
+            <input type="checkbox" id="showAxes" checked>
+          </label>
+          <div class="btn-row">
+            <button class="btn" id="zeroBtn" title="Make the current heading 0°">Zero heading</button>
+            <button class="btn" id="calBtn" title="Re-measure gyro bias (~2 s, robot must be still)">Calibrate gyro</button>
+            <button class="btn" id="clearBtn">Clear echoes</button>
+          </div>
+        </div>
+      </div>
+
+      <details class="console">
+        <summary>SERIAL CONSOLE</summary>
+        <pre id="console"></pre>
+      </details>
+    </aside>
+  </main>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+<script type="module" src="./viewer.js"></script>
+</body>
+</html>

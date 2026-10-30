@@ -23,9 +23,11 @@
 //   - GET /api/calibrate_gyro (re-zero gyro bias, robot still)
 //   - AUTO-mode link heartbeat (/hb) and E-STOP that also
 //     exits AUTO
+//   - full 3D attitude (gyro XYZ + accel) and a 100 Hz USB serial
+//     stream for viewer/index.html
 // =====================================================
 
-const char* FW_VERSION = "autobot_mapping-1.5";
+const char* FW_VERSION = "autobot_mapping-1.6";
 
 const char* ssid = "BotController";
 const char* password = "robot1234";
@@ -145,11 +147,14 @@ const uint8_t MPU_ADDR = 0x68;
 const uint8_t MPU_REG_SMPLRT_DIV = 0x19;
 const uint8_t MPU_REG_CONFIG = 0x1A;
 const uint8_t MPU_REG_GYRO_CONFIG = 0x1B;
-const uint8_t MPU_REG_GYRO_ZOUT_H = 0x47;
+const uint8_t MPU_REG_ACCEL_CONFIG = 0x1C;
+const uint8_t MPU_REG_ACCEL_XOUT_H = 0x3B;  // accel, temp, gyro: 14 B
 const uint8_t MPU_REG_PWR_MGMT_1 = 0x6B;
 const uint8_t MPU_REG_WHO_AM_I = 0x75;
 // +/-1000 dps: spins reached the old +/-250 dps limit and clipped.
 const float GYRO_LSB_PER_DPS = 32.8f;
+// +/-4 g: bumps while driving clipped at +/-2 g.
+const float ACCEL_LSB_PER_G = 8192.0f;
 
 const int64_t IMU_INTERVAL_US = 5000;     // poll gyro at ~200 Hz
 const float IMU_MAX_DT_S = 0.05f;         // longer gaps are counted
@@ -174,6 +179,22 @@ const int GYRO_CAL_STARTUP_ATTEMPTS = 3;
 const unsigned long ZUPT_SETTLE_MS = 800;
 const float ZUPT_MAX_RATE_DPS = 1.5f;
 const float ZUPT_BIAS_ALPHA = 0.002f;
+
+// 3D attitude (Mahony filter). Gyro gives the motion; gravity from
+// the accelerometer slowly pulls roll / pitch back to the truth. The
+// accel is ignored while the robot accelerates hard (|a| far from
+// 1 g), when it does not point along gravity. Yaw has no absolute
+// reference (no magnetometer), so it drifts like yaw_deg does.
+const float ATT_KP = 2.0f;                // accel correction gain, 1/s
+const float ATT_ACC_MIN_G = 0.85f;
+const float ATT_ACC_MAX_G = 1.15f;
+
+// USB serial stream for viewer/index.html. Off until the viewer
+// sends "@stream 1", so the Serial Monitor stays readable. The viewer
+// repeats that every second; the stream stops 3 s after it goes away.
+const uint32_t SERIAL_BAUD = 921600;
+const int64_t STREAM_INTERVAL_US = 10000; // 100 Hz
+const unsigned long STREAM_KEEPALIVE_MS = 3000;
 
 const unsigned long DIAG_INTERVAL_MS = 1000;
 
@@ -247,6 +268,25 @@ float gyroPrevRateDps = 0;
 double yawUnwrappedDeg = 0; // + = counter-clockwise, chip face up
 bool gyroStationary = false;
 
+// Gyro X / Y (bias removed) and accel, sensor axes.
+float gyroXDps = 0;
+float gyroYDps = 0;
+float gyroXBiasDps = 0;
+float gyroYBiasDps = 0;
+float accelG[3] = {0, 0, 1};
+// Sensor -> world rotation (w, x, y, z), world Z up.
+float attQ[4] = {1, 0, 0, 0};
+bool attInit = false;
+
+// Viewer serial stream
+bool streamOn = false;
+unsigned long streamKeepaliveMs = 0;
+int64_t streamLastUs = 0;
+unsigned long streamFrames = 0;
+unsigned long streamDropped = 0;
+char serialCmd[40];
+int serialCmdLen = 0;
+
 enum GyroCalState {
   CAL_NONE,
   CAL_RUNNING,
@@ -261,6 +301,8 @@ int calCount = 0;
 double calMean = 0;
 double calM2 = 0;
 float calStddevDps = 0;
+double calSumX = 0;
+double calSumY = 0;
 
 // Ultrasonic: echo edges timed in an ISR, processed in loop().
 volatile int64_t echoRiseUs = 0;
@@ -656,11 +698,13 @@ bool mpuInit() {
                   "Compatible clone? Continuing.\n", who);
   }
 
-  // Wake, PLL clock from gyro X, 200 Hz, DLPF ~44 Hz, +/-1000 dps.
+  // Wake, PLL clock from gyro X, 200 Hz, DLPF ~44 Hz, +/-1000 dps,
+  // +/-4 g.
   bool ok = mpuWrite(MPU_REG_PWR_MGMT_1, 0x01) &&
             mpuWrite(MPU_REG_SMPLRT_DIV, 0x04) &&
             mpuWrite(MPU_REG_CONFIG, 0x03) &&
-            mpuWrite(MPU_REG_GYRO_CONFIG, 0x10);
+            mpuWrite(MPU_REG_GYRO_CONFIG, 0x10) &&
+            mpuWrite(MPU_REG_ACCEL_CONFIG, 0x08);
 
   if (!ok) {
     Serial.println("[IMU] ERROR: MPU6050 configuration write failed.");
@@ -673,15 +717,93 @@ bool mpuInit() {
   return true;
 }
 
-bool mpuReadGyroZ(int16_t& raw) {
-  uint8_t buf[2];
+// One burst read: accel XYZ, temperature, gyro XYZ (raw counts).
+bool mpuReadAll(int16_t accel[3], int16_t gyro[3]) {
+  uint8_t buf[14];
 
-  if (!mpuRead(MPU_REG_GYRO_ZOUT_H, buf, 2)) {
+  if (!mpuRead(MPU_REG_ACCEL_XOUT_H, buf, 14)) {
     return false;
   }
 
-  raw = (int16_t)((buf[0] << 8) | buf[1]);
+  for (int i = 0; i < 3; i++) {
+    accel[i] = (int16_t)((buf[2 * i] << 8) | buf[2 * i + 1]);
+    gyro[i] = (int16_t)((buf[8 + 2 * i] << 8) | buf[9 + 2 * i]);
+  }
+
   return true;
+}
+
+void quatNormalize(float q[4]) {
+  float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  if (n < 1e-6f) {
+    q[0] = 1; q[1] = q[2] = q[3] = 0;
+    return;
+  }
+  for (int i = 0; i < 4; i++) q[i] /= n;
+}
+
+// Level the attitude from gravity alone, heading 0. Used at start-up
+// and after a calibration, which also zeroes yaw_deg.
+void attitudeFromAccel() {
+  float ax = accelG[0], ay = accelG[1], az = accelG[2];
+  float roll = atan2f(ay, az);
+  float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
+  float cr = cosf(roll / 2), sr = sinf(roll / 2);
+  float cp = cosf(pitch / 2), sp = sinf(pitch / 2);
+
+  attQ[0] = cr * cp;
+  attQ[1] = sr * cp;
+  attQ[2] = cr * sp;
+  attQ[3] = -sr * sp;
+  quatNormalize(attQ);
+  attInit = true;
+}
+
+// Mahony update. g = body rates in rad/s, accelG in g.
+void attitudeUpdate(float gx, float gy, float gz, float dt) {
+  if (!attInit) {
+    attitudeFromAccel();
+    return;
+  }
+
+  float* q = attQ;
+  float ax = accelG[0], ay = accelG[1], az = accelG[2];
+  float an = sqrtf(ax * ax + ay * ay + az * az);
+
+  if (an > ATT_ACC_MIN_G && an < ATT_ACC_MAX_G) {
+    ax /= an; ay /= an; az /= an;
+
+    // "Up" as the current estimate sees it, in sensor axes.
+    float vx = 2 * (q[1] * q[3] - q[0] * q[2]);
+    float vy = 2 * (q[0] * q[1] + q[2] * q[3]);
+    float vz = q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3];
+
+    // Rotate the estimate towards the measured up direction.
+    gx += ATT_KP * (ay * vz - az * vy);
+    gy += ATT_KP * (az * vx - ax * vz);
+    gz += ATT_KP * (ax * vy - ay * vx);
+  }
+
+  float h = 0.5f * dt;
+  float w = q[0], x = q[1], y = q[2], z = q[3];
+  q[0] += h * (-x * gx - y * gy - z * gz);
+  q[1] += h * ( w * gx + y * gz - z * gy);
+  q[2] += h * ( w * gy - x * gz + z * gx);
+  q[3] += h * ( w * gz + x * gy - y * gx);
+  quatNormalize(q);
+}
+
+float attRollDeg() {
+  const float* q = attQ;
+  return atan2f(2 * (q[0] * q[1] + q[2] * q[3]),
+                1 - 2 * (q[1] * q[1] + q[2] * q[2])) * RAD_TO_DEG;
+}
+
+float attPitchDeg() {
+  const float* q = attQ;
+  float s = 2 * (q[0] * q[2] - q[3] * q[1]);
+  s = s > 1 ? 1 : (s < -1 ? -1 : s);
+  return asinf(s) * RAD_TO_DEG;
 }
 
 double wrap180(double deg) {
@@ -709,6 +831,8 @@ bool startGyroCalibration() {
   calCount = 0;
   calMean = 0;
   calM2 = 0;
+  calSumX = 0;
+  calSumY = 0;
   gyroCalState = CAL_RUNNING;
 
   Serial.println("[IMU] Gyro bias calibration started - keep the robot still.");
@@ -728,6 +852,8 @@ void gyroCalibrationStep() {
   double delta = gyroRawDps - calMean;
   calMean += delta / calCount;
   calM2 += delta * (gyroRawDps - calMean);
+  calSumX += gyroXDps + gyroXBiasDps;
+  calSumY += gyroYDps + gyroYBiasDps;
 
   if (calCount < GYRO_CAL_SAMPLES) {
     return;
@@ -745,6 +871,8 @@ void gyroCalibrationStep() {
   }
 
   gyroBiasDps = calMean;
+  gyroXBiasDps = calSumX / calCount;
+  gyroYBiasDps = calSumY / calCount;
   gyroCalState = CAL_OK;
   logEvent(EV_IMU, "cal_ok", calCount, 0, gyroBiasDps);
   Serial.printf("[IMU] Gyro Z bias = %.4f dps (noise %.3f dps, %d samples)\n",
@@ -795,9 +923,10 @@ void imuUpdate() {
 
   imuLastPollUs = nowUs;
 
-  int16_t raw;
+  int16_t accelRaw[3];
+  int16_t gyroRaw[3];
 
-  if (!mpuReadGyroZ(raw)) {
+  if (!mpuReadAll(accelRaw, gyroRaw)) {
     imuErrors++;
 
     if (++imuConsecutiveErrors >= IMU_MAX_CONSECUTIVE_ERRORS) {
@@ -807,6 +936,7 @@ void imuUpdate() {
   }
 
   imuConsecutiveErrors = 0;
+  int16_t raw = gyroRaw[2];
 
   if (raw == gyroLastRaw) {
     if (++gyroSameRawCount >= GYRO_FROZEN_SAMPLES) {
@@ -824,6 +954,12 @@ void imuUpdate() {
 
   gyroSampleCount++;
   gyroRawDps = raw / GYRO_LSB_PER_DPS;
+  gyroXDps = gyroRaw[0] / GYRO_LSB_PER_DPS - gyroXBiasDps;
+  gyroYDps = gyroRaw[1] / GYRO_LSB_PER_DPS - gyroYBiasDps;
+
+  for (int i = 0; i < 3; i++) {
+    accelG[i] = accelRaw[i] / ACCEL_LSB_PER_G;
+  }
 
   if (gyroCalState == CAL_RUNNING) {
     gyroCalibrationStep();
@@ -857,6 +993,11 @@ void imuUpdate() {
   }
 
   gyroPrevRateDps = rate;
+
+  // Z uses the same bias-corrected, zero-when-still rate as yaw_deg,
+  // so the 3D heading drifts no more than yaw_deg does.
+  attitudeUpdate(gyroXDps * DEG_TO_RAD, gyroYDps * DEG_TO_RAD,
+                 rate * DEG_TO_RAD, dt);
 }
 
 // =====================================================
@@ -1953,6 +2094,8 @@ void handleTelemetry() {
     "\"imu_gaps\":%lu,"
     "\"yaw_deg\":%.3f,"
     "\"yaw_unwrapped_deg\":%.3f,"
+    "\"roll_deg\":%.2f,"
+    "\"pitch_deg\":%.2f,"
     "\"gyro_z_dps\":%.3f,"
     "\"gyro_z_raw_dps\":%.3f,"
     "\"gyro_bias_dps\":%.4f,"
@@ -1996,6 +2139,8 @@ void handleTelemetry() {
     imuGapCount,
     wrap180(yawUnwrappedDeg),
     yawUnwrappedDeg,
+    attRollDeg(),
+    attPitchDeg(),
     gyroRateDps,
     gyroRawDps,
     gyroBiasDps,
@@ -2159,11 +2304,14 @@ void setupImu() {
 
   yawUnwrappedDeg = 0;
   gyroPrevRateDps = 0;
+  attitudeFromAccel();
   imuLastHealthMs = millis();
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Big TX buffer so a 100 Hz viewer stream never stalls loop().
+  Serial.setTxBufferSize(2048);
+  Serial.begin(SERIAL_BAUD);
   delay(50);
 
   bootId = esp_random();
@@ -2557,6 +2705,98 @@ void serialDiagnostics() {
                 (unsigned long)ESP.getFreeHeap());
 }
 
+// =====================================================
+// VIEWER SERIAL STREAM (viewer/index.html over USB)
+// =====================================================
+//
+// Commands, one per line:
+//   @stream 1   start (or keep alive) the 100 Hz stream
+//   @stream 0   stop it
+//   @cal        re-zero the gyro bias (motors must be stopped)
+//
+// Frame, one line every 10 ms:
+//   @I,ms,qw,qx,qy,qz,yaw_deg,gx,gy,gz,ax,ay,az,dist_cm,us_seq,
+//      us_status,left,right,imu_ok,gyro_cal,mode,dropped
+// q = sensor -> world (Z up), gyro in dps (bias removed), accel in
+// g, dist_cm = -1 when there is no valid echo.
+
+void handleSerialCommand(const char* cmd) {
+  if (strcmp(cmd, "@stream 1") == 0) {
+    if (!streamOn) {
+      Serial.println("[VIEW] Stream on (100 Hz).");
+    }
+    streamOn = true;
+    streamKeepaliveMs = millis();
+  } else if (strcmp(cmd, "@stream 0") == 0) {
+    streamOn = false;
+    Serial.println("[VIEW] Stream off.");
+  } else if (strcmp(cmd, "@cal") == 0) {
+    if (leftApplied != 0 || rightApplied != 0) {
+      Serial.println("[VIEW] Calibration refused: stop the motors first.");
+    } else if (!startGyroCalibration()) {
+      Serial.println("[VIEW] Calibration refused: IMU not OK.");
+    }
+  }
+}
+
+void serialCommands() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (serialCmdLen > 0) {
+        serialCmd[serialCmdLen] = 0;
+        handleSerialCommand(serialCmd);
+        serialCmdLen = 0;
+      }
+    } else if (serialCmdLen < (int)sizeof(serialCmd) - 1) {
+      serialCmd[serialCmdLen++] = c;
+    }
+  }
+
+  if (streamOn && millis() - streamKeepaliveMs > STREAM_KEEPALIVE_MS) {
+    streamOn = false;
+    Serial.println("[VIEW] Viewer gone - stream off.");
+  }
+}
+
+void serialStream() {
+  if (!streamOn) return;
+
+  int64_t nowUs = esp_timer_get_time();
+  if (nowUs - streamLastUs < STREAM_INTERVAL_US) return;
+  streamLastUs = nowUs;
+
+  char line[200];
+  int n = snprintf(line, sizeof(line),
+    "@I,%lu,%.5f,%.5f,%.5f,%.5f,%.2f,%.1f,%.1f,%.1f,%.3f,%.3f,%.3f,"
+    "%.1f,%lu,%s,%d,%d,%d,%s,%s,%lu\n",
+    millis(),
+    attQ[0], attQ[1], attQ[2], attQ[3],
+    yawUnwrappedDeg,
+    gyroXDps, gyroYDps, gyroRateDps,
+    accelG[0], accelG[1], accelG[2],
+    usValid ? usDistanceCm : -1.0f,
+    (unsigned long)usSeq,
+    usStatus,
+    leftApplied, rightApplied,
+    imuOk ? 1 : 0,
+    gyroCalName(),
+    autoMode ? "auto" : "manual",
+    streamDropped);
+
+  if (n <= 0 || n >= (int)sizeof(line)) return;
+
+  // Never block loop() on a full UART: drop the frame instead.
+  if (Serial.availableForWrite() < n) {
+    streamDropped++;
+    return;
+  }
+
+  Serial.write((const uint8_t*)line, n);
+  streamFrames++;
+}
+
 // Track the home Wi-Fi link: log changes, start mDNS, retry.
 void updateHomeWifi() {
   if (!homeWifiEnabled) return;
@@ -2665,4 +2905,8 @@ void loop() {
   currentActivity = "wifi_log";
   logPeriodic();
   serialDiagnostics();
+
+  currentActivity = "serial";
+  serialCommands();
+  serialStream();
 }
