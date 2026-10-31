@@ -8,6 +8,9 @@ An ESP32 differential-drive robot. You drive it with the phone controller, and a
 | `autobot_mapping/autobot_mapping.ino` | ESP32 firmware: the phone controller (unchanged UI and behaviour), gyro yaw, background ultrasonic, `/api/telemetry` |
 | `mac_mapper.py` | Mac live mapper (read-only: it never drives the motors) |
 | `viewer/` | USB live sensor viewer: 3D robot that follows the IMU, ultrasonic beam and echo radar (§4c) |
+| `tools/link_stress.py` | Stress test of the Wi-Fi link to the real robot, with a PASS/FAIL verdict (§10b) |
+| `tools/fake_robot.py` | A fake robot (same protocol) with failure modes, for testing without hardware |
+| `tests/` | `pytest tests/`: chaos tests of the mapper link and the phone page (§10b) |
 | `requirements.txt` | Python dependencies (numpy, matplotlib, requests) |
 | `sketch_oct27b/`, `sketch_oct27a/` | Earlier controller-only sketches, kept for reference |
 
@@ -68,27 +71,43 @@ CLI="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/
 Expected output (the numbers will differ):
 
 ```
+[BOOT] Boot #12, reset reason: power_on
+[BOOT] Previous boot #11 (autobot_mapping-2.0) ended after 312.4 s.
 =========================================
-AUTOBOT autobot_mapping-1.6 booting (reset reason: power_on)
+AUTOBOT autobot_mapping-2.0 booting (reset reason: power_on)
 Keep the robot STILL for gyro calibration.
 =========================================
+[WIFI] Joining home network "MyWifi" (non-blocking)...
+
+AUTOBOT MOBILE UNIT ONLINE
+Wi-Fi: MyWifi
+Controller: http://192.168.1.200
+API: /api/telemetry /api/samples /api/log /api/diag  WS: /ws
 [IMU] MPU6050 found (WHO_AM_I=0x68)
 [IMU] Startup calibration 1/3
 [IMU] Gyro bias calibration started - keep the robot still.
 [IMU] Gyro Z bias = -1.2345 dps (noise 0.041 dps, 400 samples)
-
-AUTOBOT MOBILE UNIT ONLINE
-Wi-Fi: BotController
-Controller: http://192.168.4.1
-Telemetry:  http://192.168.4.1/api/telemetry
-[STAT] t=    4.0s MANUAL yaw=    0.00 rate=   0.00 bias=-1.234 imu=OK cal=ok rst=0 | us= 123.4cm ok           | L=   0 R=   0 | loop=40000Hz clients=0 heap=230000
+[IMU] Ready (gyro cal: ok). Drive enabled.
+[NET] Phone/client connected (.23, socket 58, 1 open)
+[STAT] t=    4.0s MANUAL yaw=    0.00 rate=   0.00 bias=-1.234 imu=OK cal=ok rst=0 | us= 123.4cm ok           | L=   0 R=   0 | loop=990Hz max=2ms clients=1 heap=180000
 ```
 
-One `[STAT]` line prints per second. Other messages you may see:
-`[SAFETY] Drive heartbeat lost - motors stopped.` (the watchdog),
-`[IMU] ERROR: MPU6050 not responding ...` (wiring), `[MODE] AUTO`.
+Since v2.0 the robot is reachable within about a second of a reset; the gyro calibrates
+afterwards (the phone shows `CALIBRATING GYRO - KEEP STILL` and refuses to drive meanwhile).
+If the previous boot ended in a crash, watchdog or brownout, `[BOOT]` also prints its last
+events before the reset.
+
+One `[STAT]` line prints per second (`max=` is the slowest pass of the control loop). Other
+messages you may see: `[SAFETY] Drive heartbeat lost - motors stopped.` (the watchdog),
+`[NET] Client .23 disconnected`, `[IMU] ERROR: MPU6050 not responding ...` (wiring),
+`[MODE] AUTO`.
 
 ## 4. Connect the phone and the Mac
+
+The phone page shows the real link state in the top-right corner: **ONLINE 12 MS** (round
+trip), **WEAK** (slow or late), or **RECONNECTING**. On RECONNECTING the sticks are released
+and the robot stops; the page reconnects by itself, with no reload. Touch the stick again
+to drive.
 
 Both devices join the robot's own Wi-Fi network:
 
@@ -179,6 +198,15 @@ You should see something like this (abridged):
 To re-zero the gyro bias at any time, stop the robot, then:
 `curl http://192.168.4.1/api/calibrate_gyro`
 
+Other endpoints (v2.0):
+
+| Endpoint | What |
+|---|---|
+| `/api/samples?since=N` | Every 25 Hz sample after N as CSV, no gaps (the robot keeps ~20 s). The mapper uses this. |
+| `/api/diag` | Health now (loop timing, heap, stack, Wi-Fi drops and last reason code, client count) **and the last 4 boots from flash**: reset reason, how long each ran, and its last events before the reset. Survives power-off. |
+| `/api/log?since=N` | The event log (§11b). |
+| `/ws` | The phone's WebSocket (§11a). |
+
 ## 6. Python setup (macOS) — do this while still on your normal Wi-Fi
 
 ```bash
@@ -196,12 +224,26 @@ python mac_mapper.py --simulate      # try the map window with a simulated robot
 ```bash
 cd ~/elco/optimus
 source .venv/bin/activate
-# join the BotController Wi-Fi, then:
 python mac_mapper.py
-# options: --rate 8 (5–10 Hz)  --url http://192.168.4.1/api/telemetry  --no-record
+# options: --url http://192.168.1.200   --no-record
 # replay a recorded session (no robot needed):
-python mac_mapper.py --replay maps/logs/telemetry_YYYYmmdd_HHMMSS.jsonl --speed 4
+python mac_mapper.py --replay maps/logs/YYYYmmdd_HHMMSS/telemetry.jsonl --speed 4
 ```
+
+Each run writes one folder, `maps/logs/<YYYYmmdd_HHMMSS>/`:
+
+| File | Contents |
+|---|---|
+| `mapper.log` | **Start here when something fails.** Every link error with its full message, each outage with its duration (`link DOWN` … `link UP again after 4.2 s`), robot reboots with the reset reason, threads that crashed (with traceback) or stalled (with the stacks of all threads). |
+| `diag_*.json` | The robot's `/api/diag`, saved at start, after every reconnect and after every robot reboot. |
+| `robotlog.csv`, `robotlog.timeline.png` | The robot's own event log and timeline (§11b). |
+| `telemetry.jsonl` | Every sample, for `--replay`. |
+| `summary.txt` | The link statistics and the robot-log report, written at exit. |
+| `faults.log` | Only written if Python itself crashes hard. |
+
+The mapper gets **every** sample (25 Hz) over one connection; if Wi-Fi drops for less than
+~20 s, nothing is lost. If the robot does not answer for 3 s, the mapper looks for it at all
+known addresses again.
 
 **Keys** (click the map window first so it has focus):
 
@@ -267,7 +309,7 @@ that affects the *distance* estimate. Leave them at 1.0 unless you have measured
 
 | Symptom | What to check |
 |---|---|
-| Mapper says `CONNECTING`/`DISCONNECTED` | Is the Mac on the **BotController** Wi-Fi? Run `curl -m 2 http://192.168.4.1/api/telemetry`. macOS can drop a no-internet Wi-Fi network: turn off "Auto-Join" for your home network while mapping. |
+| Mapper says `CONNECTING`/`DISCONNECTED` | Read `mapper.log` in the session folder: every failed request is there with its exact error. Is the Mac on the same Wi-Fi as the robot? Run `curl -m 2 http://192.168.1.200/api/diag`. On BotController, macOS can drop the no-internet network: turn off "Auto-Join" for your home network while mapping. |
 | `STALE` | The robot was reset or is out of range. Look at the `[STAT]` lines in the Serial Monitor. Also check whether the `millis` value in the browser is advancing. |
 | `IMU FAIL` / `imu_ok:false` | `[IMU] ERROR` on serial: check SDA = 21 and SCL = 22, **VCC on 3V3**, GND, and that AD0 is low. Run a quick I²C check by watching for the `WHO_AM_I` line at boot. A WHO_AM_I other than 0x68 just means a clone and is fine. |
 | Yaw drifts while still | The bias calibration happened while the robot was moving (`cal=unverified`/`failed_motion`). Stop the robot and run `curl http://192.168.4.1/api/calibrate_gyro`. A drift of a few degrees per minute while driving is normal for an MPU6050. |
@@ -282,12 +324,73 @@ that affects the *distance* estimate. Leave them at 1.0 unless you have measured
 | **Only reverse works (forward blocked)** | The forward guard is latched. The phone shows `OBSTACLE xx CM - TURN OR REVERSE` with the distance the robot thinks it sees. If nothing is really there, the ECHO wire is picking up motor noise: route it away from the motor wires, twist it with a GND wire, and add a 100 µF capacitor across the HC-SR04's 5 V/GND. Since v1.2, 2 of the last 3 readings must agree, short noise pulses are ignored, and the guard releases by itself after 2 s without confirmation. To switch it off: `MANUAL_OBSTACLE_GUARD = false`. |
 | **Wi-Fi drops and then the sensor and everything else stop working** | Before v1.5, a network reply stuck on a bad Wi-Fi link could freeze the robot's program for minutes (each network write can wait up to 10 s), with the motors still running. v1.5 fixes this: log replies fit in one non-blocking write, a separate **dead-man timer cuts the motors if the program freezes for 0.3 s**, and the chip reboots after a 5 s hang. Every freeze is logged as `ROBOT PROGRAM FROZE <ms> in <where>`, and the report lists them under `PROGRAM FREEZES`. |
 | Mapper says `STALE` and the robot restarts | The serial boot line and the mapper's event log show `reset reason`. `brownout` means the motor current pulled the supply down and the ESP32 rebooted. Fix the power: a separate battery or regulator for the ESP32 (common GND), a large capacitor on the motor supply, and no instant forward/reverse reversals at full power. |
-| Joysticks feel laggy while mapping | Lower the poll rate: `python mac_mapper.py --rate 5`. Check that the `loop=` value on serial stays above about 1000 Hz. |
-| Robot stops while you hold the stick | That is the 700 ms drive watchdog: the phone's requests are not arriving. Move closer to the robot. |
+| Joysticks feel laggy | Look at the round-trip time on the phone (`ONLINE xx MS`). Over ~100 ms is the Wi-Fi itself: move closer, or use the 2.4 GHz band with less traffic. Run `python tools/link_stress.py` (§10b) to measure it. |
+| Robot stops while you hold the stick | The 500 ms drive watchdog: no stick update arrived. The phone shows WEAK or RECONNECTING when this is the link. The robot log names it: `SAFETY STOP: manual heartbeat lost` or `link_closed`. |
+| Phone shows RECONNECTING often | `mapper.log` / `robotlog.csv`: look for `Wi-Fi DISCONNECTED from router: reason …` (the reason code says why: weak signal, password, AP kicked us) and `robot closed a SILENT client`. |
 | AUTO mode stops by itself | The phone stopped sending heartbeats for 2 s (screen locked, or app switched). This is intentional. |
 | Keys do nothing | Click inside the map window first. |
 
+## 10b. Debugging a failure, and testing the link
+
+**When anything fails, the reason is written down in one of three places:**
+
+1. `maps/logs/<session>/mapper.log`: what the Mac saw (errors, outages and their length,
+   reboots and reset reasons, crashed or stalled threads with stack traces).
+2. The robot's event log (`robotlog.csv`, or `python mac_mapper.py --analyze …`): what the
+   robot did and why it stopped: watchdog, E-STOP, Wi-Fi drop with reason code, client
+   disconnects, loop freezes with their location.
+3. `/api/diag` (saved as `diag_*.json`): **why the robot rebooted**, even after a power-off:
+   the last 4 boots with reset reason (`brownout`, `crash`, `watchdog`, …) and each one's
+   final events.
+
+**Stress-test the real link** (the robot does not move; it sends throttle 0):
+
+```bash
+python tools/link_stress.py --minutes 5                 # alone
+python tools/link_stress.py --minutes 5 --clients 2     # + 2 extra clients
+# then again with the phone page open and mac_mapper.py running
+```
+
+It acts as the phone (20 Hz drive frames, 4 pings/s) and as the mapper at once, and passes
+when: no robot reset, no lost samples, round trip p95 < 60 ms, no gap > 300 ms between status
+messages, no WebSocket drops. The report is saved in `maps/logs/stress_*/`.
+
+**Without hardware:** `pytest tests/` runs the mapper link and the real phone page (headless
+Chrome) against `tools/fake_robot.py`, which drops, freezes, reboots, corrupts and slows down
+on purpose. The tests check that nothing crashes, hangs or deadlocks, that samples arrive
+in order with no gaps, that every outage is logged, and that the phone page reconnects by
+itself. To try the mapper by hand: `python tools/fake_robot.py --port 8080 --chaos drop` and
+`python mac_mapper.py --url http://127.0.0.1:8080`.
+
 ## 11. Firmware behaviour changes from `sketch_oct27b`
+
+**v2.0: the link was rebuilt (the cause of the disconnects).**
+
+Before v2.0, the web server ran inside the control loop. It served **one connection at a
+time with a waiting queue of one**, and every request opened a new connection. The phone sent
+a request on *every* touch movement (60–120/s) and the Mac about 10/s, so connection
+attempts were silently dropped, each costing about a second before the retry. That tripped
+the drive watchdog ("disconnect"), and a stalled request could freeze the loop long enough to
+reboot the chip. Now:
+
+* The server (`esp_http_server`) runs in **its own task** and serves up to 7 connections at
+  once. The control loop never touches the network: commands arrive through a queue, and
+  replies are built from a snapshot. A slow phone or Mac can only delay its own replies,
+  never the motors or another client.
+* The phone uses **one WebSocket**. It sends the newest stick position 20x/s while a stick is
+  held (and 3 stops on release), never more than one frame queued, plus 4 pings/s for the
+  round-trip time. The robot pushes its status 10x/s. The watchdog is now **500 ms**
+  (10 missed frames). If the driving phone's socket closes, the robot stops at once.
+* Dead connections are cleaned up: the page drops a socket that has gone silent for 2.5 s and
+  reconnects; the robot closes a client that has been silent for 3 s.
+* E-STOP no longer fires when the page merely loses focus (notification shade, popups);
+  it still fires when the page is hidden or the screen locks.
+* Wi-Fi starts **before** the gyro calibration, so the robot is reachable right after a reset.
+* New: `/api/samples` (lossless 25 Hz feed for mapping), `/api/diag` (health + boot history
+  in flash), Wi-Fi disconnect reason codes, client connect/disconnect events, the slowest loop
+  pass each second, heap and stack headroom, and a check that the server task is alive.
+* Concurrency fixes: the event log is locked (four tasks write to it), and the
+  "where was the loop stuck" pointer is now really `volatile`.
 
 **Speed and obstacle handling (firmware v1.1):**
 * The default max power is **120/255** (it was 180). The slider still covers 80–255.
@@ -343,13 +446,17 @@ and you can read it at `http://192.168.4.1/api/log`. It records:
 * every motor change, tagged with **who caused it**: `phone`, `guard`, `watchdog_manual`,
   `estop_page_hidden`, `auto_backoff`, …;
 * joystick changes;
-* phone command gaps longer than 300 ms (`LINKGAP`);
+* phone command gaps longer than 200 ms (`LINKGAP`);
+* phones connecting and disconnecting, silent clients closed, phone-side reconnects and slow
+  round trips (`LINK`);
 * watchdog trips;
 * emergency stops, with whether it was the button or the phone page losing focus;
 * guard latches and releases, and AUTO decisions;
 * IMU faults and recoveries;
-* Wi-Fi devices joining or leaving;
-* loop rate, free memory and HTTP requests per second.
+* Wi-Fi drops with the **reason code** (`beacon timeout`, `auth fail`, …), devices joining or
+  leaving;
+* loop rate, the slowest loop pass, free memory, WebSocket frames and HTTP requests per
+  second; every 10 s the minimum free heap and stack headroom (`HEALTH`).
 
 The last ~3 s are also kept in RTC memory, which usually survives a crash or brownout
 reset. After a reboot those events appear as `[BEFORE RESET]`.
@@ -363,11 +470,11 @@ Important events print live, for example `SAFETY STOP: manual heartbeat lost (76
 `FORWARD BLOCKED by guard at 6.0 cm`, or `ROBOT BOOTED, reset reason: brownout`.
 
 The normal map mode (`python mac_mapper.py`) records the same log, shows the important
-events in the panel, and prints the report when you quit. Files go in `maps/logs/`:
-`robotlog_*.csv` (every event, with a readable `description` column),
-`robotlog_*.timeline.png`, and `telemetry_*.jsonl`.
+events in the panel, and prints the report when you quit. Files go in the session folder
+`maps/logs/<time>/` (§7): `robotlog.csv` (every event, with a readable `description`
+column), `robotlog.timeline.png`, `telemetry.jsonl` and `mapper.log`.
 
-**Analyse a saved log again:** `python mac_mapper.py --analyze maps/logs/robotlog_<time>.csv`
+**Analyse a saved log again:** `python mac_mapper.py --analyze maps/logs/<time>/robotlog.csv`
 
 The report shows:
 * **Resets** and their reason. `brownout` means the motors pulled the supply down.
@@ -383,7 +490,10 @@ The timeline chart puts range, motor PWM, yaw and all the events on one time axi
 
 1. **Bench, wheels off the ground.** Upload, watch serial, check `cal=ok` and `imu=OK`. Use the
    phone to check that forward, reverse, left, right and E-STOP behave exactly as before. Close
-   the phone browser while holding a stick: the motors must stop within about 0.7 s.
+   the phone browser while holding a stick: the motors must stop at once (socket closed) or
+   within 0.5 s at most. Turn the phone's Wi-Fi off while holding a stick: the motors must
+   stop within 0.5 s and the page must show RECONNECTING, then ONLINE when Wi-Fi is back.
+1b. **Link.** `python tools/link_stress.py --minutes 5` must PASS (§10b).
 2. **Telemetry.** Open `/api/telemetry` on the Mac while driving the wheels from the phone.
    `left_cmd`/`right_cmd` should follow the sticks, and the joysticks must stay responsive.
 3. **Sensors.** Move a hand in front of the HC-SR04 and watch `distance_cm`. Rotate the robot
@@ -398,11 +508,12 @@ The timeline chart puts range, motor PWM, yaw and all the events on one time axi
 
 ## 13. How it works (short)
 
-* **Firmware:** `loop()` never blocks. Each pass it services HTTP, polls the gyro every 5 ms
+* **Firmware:** `loop()` never blocks and never touches the network (about 1000 passes/s).
+  Each pass it applies queued commands from the phone, polls the gyro every 5 ms
   (trapezoidal integration with the real elapsed time from `esp_timer`), and pings the HC-SR04
   every 60 ms. The echo edges are timestamped in an interrupt, so no `pulseIn()` wait is needed.
-  It also accumulates the PWM·time integrals and runs the watchdogs. `/api/telemetry` only
-  formats cached values. When the motors have been off for 0.8 s and the rate is under 1.5°/s,
+  It also accumulates the PWM·time integrals, runs the watchdogs, and publishes a snapshot
+  (status 10x/s, samples 25x/s, telemetry 5x/s) that the separate HTTP server task sends out. When the motors have been off for 0.8 s and the rate is under 1.5°/s,
   the gyro rate is treated as zero and the bias slowly tracks it (a zero-velocity update).
 * **Mapper:** the code is split into telemetry acquisition (a background thread), validation,
   a median-of-3 range filter (only across readings taken from the same pose), gyro heading

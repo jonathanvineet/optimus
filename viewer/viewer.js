@@ -564,7 +564,12 @@ setInterval(() => {
   consoleDirty = false;
   const el = $("console");
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
-  el.textContent = consoleLines.join("\n");
+  // Reset reasons, safety stops and link problems stand out.
+  const loud = /^\[(BOOT|SAFETY|NET)\]|WARNING|ERROR|BROWNOUT|froze|Guru Meditation|panic/i;
+  const esc = (t) => t.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  el.innerHTML = consoleLines
+    .map((l) => (loud.test(l) ? `<span class="loud">${esc(l)}</span>` : esc(l)))
+    .join("\n");
   if (atBottom) el.scrollTop = el.scrollHeight;
 }, 150);
 

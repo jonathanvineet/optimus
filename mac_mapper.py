@@ -2,9 +2,15 @@
 """
 AUTOBOT live 2D occupancy-grid mapper (macOS, Python 3).
 
-Polls the ESP32 at http://192.168.4.1/api/telemetry while you drive the
-robot with the phone controller, and builds an approximate occupancy grid
-from the HC-SR04 range and the MPU6050 gyro heading.
+Reads every 25 Hz sample from the ESP32 (/api/samples, firmware 2.0+; older
+firmware is polled at /api/telemetry) while you drive the robot with the
+phone controller, and builds an approximate occupancy grid from the HC-SR04
+range and the MPU6050 gyro heading.
+
+Every run writes a session folder maps/logs/<YYYYmmdd_HHMMSS>/ with
+mapper.log (every link error, outage, reconnect, robot reboot reason,
+thread crash and stall), telemetry.jsonl, robotlog.csv, diag_*.json and
+summary.txt.
 
 READ-ONLY: this program never sends motor commands.
 
@@ -34,7 +40,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import faulthandler
 import json
+import logging
 import math
 import os
 import queue
@@ -59,14 +67,19 @@ import requests
 # =============================================================================
 
 # --- Connection --------------------------------------------------------------
-# Tried in order at startup: the robot's fixed home-network address, then the
-# robot's own BotController AP (only used if secrets.h has no home Wi-Fi).
+# Tried in order: the robot's fixed home-network address, then the robot's
+# own BotController AP (only used if secrets.h has no home Wi-Fi). While the
+# link is down the mapper keeps re-trying all of them.
 ROBOT_HOSTS = ["192.168.1.200", "192.168.4.1"]
-TELEMETRY_URL = "http://192.168.4.1/api/telemetry"   # used if discovery fails
-POLL_HZ = 8.0                    # 5-10 Hz is plenty; the ESP32 also serves the phone
-HTTP_CONNECT_TIMEOUT_S = 0.6
-HTTP_READ_TIMEOUT_S = 0.8
+TELEMETRY_URL = "http://192.168.1.200/api/telemetry"  # used if discovery fails
+POLL_HZ = 8.0                    # only for pre-2.0 firmware (/api/telemetry polling)
+SAMPLES_POLL_S = 0.2             # /api/samples: fetch everything new every 0.2 s
+HTTP_CONNECT_TIMEOUT_S = 0.8
+HTTP_READ_TIMEOUT_S = 1.5
 STALE_AFTER_S = 1.5              # no fresh telemetry for this long -> "STALE"
+REDISCOVER_AFTER_S = 3.0         # link down this long -> look for the robot again
+STILL_DOWN_LOG_S = 5.0           # while down, log a "still down" line this often
+STALL_DUMP_AFTER_S = 5.0         # a thread silent this long -> dump all stacks
 
 # --- Heading (gyro Z integrated on the ESP32) --------------------------------
 # +1: firmware yaw increases when the robot turns LEFT (counter-clockwise seen
@@ -155,6 +168,67 @@ def wrap_pi(a):
 
 def wrap_180(a):
     return (a + 180.0) % 360.0 - 180.0
+
+
+# =============================================================================
+# 0. SESSION LOGGING (everything that goes wrong ends up in mapper.log)
+# =============================================================================
+
+log = logging.getLogger("autobot")
+log.addHandler(logging.NullHandler())
+_fault_file = None
+
+
+def start_session_logging(kind="map"):
+    """Create maps/logs/<stamp>/ and send all logging there. Returns the dir."""
+    global _fault_file
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    d = Path(OUTPUT_DIR) / "logs" / stamp
+    d.mkdir(parents=True, exist_ok=True)
+
+    fh = logging.FileHandler(d / "mapper.log")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-7s [%(threadName)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S"))
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+    log.setLevel(logging.DEBUG)
+    log.addHandler(fh)
+    log.addHandler(ch)
+
+    # Hard crashes (segfault in a C extension, fatal errors) land here.
+    _fault_file = open(d / "faults.log", "a")
+    faulthandler.enable(_fault_file, all_threads=True)
+
+    def excepthook(t, v, tb):
+        log.critical("uncaught exception - mapper is exiting", exc_info=(t, v, tb))
+
+    def thread_excepthook(args):
+        log.critical("thread %s DIED", args.thread.name if args.thread else "?",
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = excepthook
+    threading.excepthook = thread_excepthook
+
+    log.info("session %s started (%s): python %s, numpy %s, requests %s, argv %s",
+             stamp, kind, sys.version.split()[0], np.__version__, requests.__version__,
+             " ".join(sys.argv))
+    print(f"Session logs: {d}/")
+    return d
+
+
+def describe_exc(e, url=""):
+    """One line naming the error class and message, for the log."""
+    text = f"{type(e).__name__}: {e}"
+    return f"{text} [{url}]" if url else text
+
+
+def base_url(url):
+    """http://host/api/telemetry -> http://host ; http://host -> http://host"""
+    url = url.rstrip("/")
+    return url.split("/api/", 1)[0] if "/api/" in url else url
 
 
 # =============================================================================
@@ -303,16 +377,100 @@ class SourceStatus:
             }
 
 
-class TelemetryClient:
-    """Polls the ESP32 in a background thread; never blocks the GUI."""
+def parse_samples_response(text):
+    """Parse /api/samples. Returns (header dict, column names, row strings)."""
+    header, cols, rows = {}, [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#cols="):
+            cols = line[6:].split(",")
+        elif line.startswith("#"):
+            for kv in line[1:].split(","):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    header[k] = v
+        else:
+            rows.append(line)
+    return header, cols, rows
 
-    def __init__(self, url=TELEMETRY_URL, poll_hz=POLL_HZ):
-        self.url = url
-        self.period = 1.0 / max(0.5, poll_hz)
-        self.samples = queue.Queue(maxsize=200)
+
+def sample_row_to_dict(cols, row, boot_id):
+    """One /api/samples CSV row -> the same dict /api/telemetry returns."""
+    vals = row.split(",")
+    if len(vals) != len(cols):
+        return None
+    d = dict(zip(cols, vals))
+    try:
+        yaw_u = float(d["yaw_unwrapped_deg"])
+        dist = d["distance_cm"]
+        return {
+            "boot_id": int(boot_id) if boot_id else None,
+            "sample_seq": int(d["seq"]),
+            "millis": int(d["millis"]),
+            "mode": "auto" if d["mode"] == "A" else "manual",
+            "distance_cm": float(dist) if dist else None,
+            "distance_valid": bool(dist),
+            "us_status": d["us_status"],
+            "us_seq": int(d["us_seq"]),
+            "us_age_ms": int(d["us_age_ms"]),
+            "imu_ok": d["imu_ok"] == "1",
+            "yaw_deg": wrap_180(yaw_u),
+            "yaw_unwrapped_deg": yaw_u,
+            "roll_deg": float(d["roll_deg"]),
+            "pitch_deg": float(d["pitch_deg"]),
+            "gyro_z_dps": float(d["gyro_z_dps"]),
+            "gyro_z_raw_dps": float(d["gyro_z_raw_dps"]),
+            "gyro_bias_dps": float(d["gyro_bias_dps"]),
+            "gyro_cal": d["gyro_cal"],
+            "left_cmd": int(d["left_cmd"]),
+            "right_cmd": int(d["right_cmd"]),
+            "left_cmd_int": float(d["left_cmd_int"]),
+            "right_cmd_int": float(d["right_cmd_int"]),
+        }
+    except (KeyError, ValueError):
+        return None
+
+
+class TelemetryClient:
+    """The robot link, in a background thread; never blocks the GUI.
+
+    Firmware 2.0+: fetches every 25 Hz sample from /api/samples over ONE
+    keep-alive connection, so nothing is lost even when Wi-Fi stutters (the
+    robot keeps ~20 s). Older firmware: polls /api/telemetry. Every error,
+    outage, reconnect and robot reboot goes to mapper.log; while the link is
+    down, all ROBOT_HOSTS are tried again. Nothing in here can kill the thread.
+    """
+
+    def __init__(self, url=TELEMETRY_URL, poll_hz=POLL_HZ, session_dir=None):
+        self.base = base_url(url)
+        self.legacy_period = 1.0 / max(0.5, poll_hz)
+        self.samples = queue.Queue(maxsize=20000)
         self.status = SourceStatus()
+        self.session_dir = Path(session_dir) if session_dir else None
+        self.mode = None                 # "samples" | "telemetry"
+        self.since = 0
+        self.boot = None
+        self.received = 0
+        self.lost_samples = 0
+        self.dropped_local = 0
+        self.bad_rows = 0
+        self.outages = []                # durations (s)
+        self.reboots = 0
+        self.ever_up = False
+        self.down_since = None
+        self.errors_in_outage = 0
+        self.last_still_down_log = 0.0
+        self.last_discovery = 0.0
+        self.want_diag = None            # reason string -> fetch /api/diag
+        self.beat = time.monotonic()     # for the stall watchdog
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="telemetry", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="link", daemon=True)
+
+    @property
+    def url(self):
+        return self.base
 
     def start(self):
         self._thread.start()
@@ -320,50 +478,255 @@ class TelemetryClient:
     def stop(self):
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                log.error("link thread did not stop within 3 s")
+
+    def summary(self):
+        return (f"samples received {self.received}, lost on robot {self.lost_samples}, "
+                f"dropped on Mac {self.dropped_local}, bad rows {self.bad_rows}, "
+                f"outages {len(self.outages)} (total {sum(self.outages):.1f} s, "
+                f"longest {max(self.outages, default=0):.1f} s), robot reboots {self.reboots}")
+
+    @staticmethod
+    def _new_session():
+        # Keep-alive: one TCP connection for the whole run. (The 2.0 firmware
+        # serves several clients at once; the phone is not starved.)
+        return requests.Session()
 
     def _run(self):
-        session = requests.Session()
-        # The ESP32 WebServer handles one connection at a time; do not hold
-        # keep-alive sockets open that could delay the phone's requests.
-        session.headers.update({"Connection": "close"})
+        log.info("link thread started, robot %s", self.base)
+        session = self._new_session()
         backoff = 0.0
         while not self._stop.is_set():
             t0 = time.monotonic()
+            self.beat = t0
             try:
-                r = session.get(self.url, timeout=(HTTP_CONNECT_TIMEOUT_S, HTTP_READ_TIMEOUT_S))
-                latency = time.monotonic() - t0
-                if r.status_code != 200:
-                    raise ValueError(f"HTTP {r.status_code}")
-                if not r.content:
-                    raise ValueError("empty response")
-                sample, err = parse_telemetry(r.json(), time.monotonic(), time.time(), latency)
-                if sample is None:
-                    raise ValueError(err)
-                self._put(sample)
-                self.status.ok(latency)
+                if self.mode == "telemetry":
+                    self._poll_telemetry(session)
+                    period = self.legacy_period
+                    self._link_ok(time.monotonic() - t0)
+                else:
+                    period = SAMPLES_POLL_S
+                    if self._poll_samples(session):
+                        self._link_ok(time.monotonic() - t0)
+                    else:
+                        period = 0.0       # switched to /api/telemetry: poll now
                 backoff = 0.0
-            except requests.exceptions.Timeout:
-                self.status.error("timeout")
-                backoff = min(1.0, backoff + 0.2)
-            except requests.exceptions.ConnectionError:
-                self.status.error("connection failed (joined BotController Wi-Fi?)")
-                backoff = min(1.0, backoff + 0.2)
-            except (ValueError, requests.exceptions.RequestException) as e:
-                self.status.error(str(e)[:80])
-                backoff = min(1.0, backoff + 0.1)
-            wait = max(0.0, self.period - (time.monotonic() - t0)) + backoff
-            self._stop.wait(wait)
+                if self.want_diag:
+                    self._fetch_diag(session, self.want_diag)
+                    self.want_diag = None
+            except Exception as e:      # anything: log it, back off, carry on
+                self._link_error(e)
+                session.close()
+                session = self._new_session()
+                # The robot answering garbage is less likely to be overloaded
+                # than one that does not answer at all.
+                backoff = min(1.0, backoff + (0.1 if isinstance(e, ValueError) else 0.2))
+                period = self.legacy_period if self.mode == "telemetry" else SAMPLES_POLL_S
+                if time.monotonic() - (self.down_since or t0) >= REDISCOVER_AFTER_S:
+                    self._rediscover()
+            self._stop.wait(max(0.0, period - (time.monotonic() - t0)) + backoff)
+        session.close()
+        log.info("link thread stopped: %s", self.summary())
+
+    def _get(self, session, path, **kw):
+        url = self.base + path
+        try:
+            return session.get(url, timeout=(HTTP_CONNECT_TIMEOUT_S, HTTP_READ_TIMEOUT_S), **kw)
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(describe_exc(e, url)) from e
+
+    def _poll_samples(self, session):
+        r = self._get(session, "/api/samples", params={"since": self.since})
+        if r.status_code == 404:
+            log.warning("robot firmware has no /api/samples (older than 2.0): "
+                        "polling /api/telemetry instead - upload the new firmware")
+            self.mode = "telemetry"
+            return False
+        if r.status_code != 200:
+            raise ValueError(f"HTTP {r.status_code} from /api/samples: {r.text[:80]!r}")
+        hdr, cols, rows = parse_samples_response(r.text)
+        if "next" not in hdr or not cols:
+            raise ValueError(f"bad /api/samples reply: {r.text[:80]!r}")
+        self.mode = "samples"
+
+        boot = hdr.get("boot")
+        if self.boot is not None and boot != self.boot:
+            self.reboots += 1
+            log.warning("ROBOT REBOOTED (boot id %s -> %s) - reading its reset reason",
+                        self.boot, boot)
+            self.boot, self.since = boot, 0
+            self.want_diag = "reboot"
+            return True
+        self.boot = boot
+
+        lost = int(hdr.get("lost", 0))
+        if lost:
+            self.lost_samples += lost
+            log.warning("LOST %d samples (link was down longer than the robot's "
+                        "~20 s buffer)", lost)
+
+        now_ms = int(hdr.get("now", 0))
+        mono, wall = time.monotonic(), time.time()
+        latency = r.elapsed.total_seconds()
+        for row in rows:
+            obj = sample_row_to_dict(cols, row, boot)
+            if obj is None:
+                self.bad_rows += 1
+                log.debug("bad sample row: %r", row[:120])
+                continue
+            # Arrival time reconstructed from the robot clock (keeps spacing).
+            age = ((now_ms - obj["millis"]) % MILLIS_MOD) / 1000.0
+            if age > 60.0:
+                age = 0.0
+            s, err = parse_telemetry(obj, mono - age, wall - age, latency)
+            if s is None:
+                self.bad_rows += 1
+                log.debug("sample rejected (%s): %r", err, row[:120])
+                continue
+            self._put(s)
+            self.received += 1
+        self.since = int(hdr["next"])
+        return True
+
+    def _poll_telemetry(self, session):
+        r = self._get(session, "/api/telemetry")
+        latency = r.elapsed.total_seconds()
+        if r.status_code != 200:
+            raise ValueError(f"HTTP {r.status_code} from /api/telemetry")
+        if not r.content:
+            raise ValueError("empty response")
+        sample, err = parse_telemetry(r.json(), time.monotonic(), time.time(), latency)
+        if sample is None:
+            raise ValueError(err)
+        if self.boot is not None and sample.boot_id is not None and str(sample.boot_id) != self.boot:
+            self.reboots += 1
+            log.warning("ROBOT REBOOTED (boot id %s -> %s)", self.boot, sample.boot_id)
+        self.boot = str(sample.boot_id) if sample.boot_id is not None else None
+        self._put(sample)
+        self.received += 1
+
+    def _link_ok(self, latency):
+        now = time.monotonic()
+        if self.down_since is not None:
+            dur = now - self.down_since
+            self.outages.append(dur)
+            log.warning("link UP again after %.1f s down (%d errors), robot %s",
+                        dur, self.errors_in_outage, self.base)
+            self.down_since = None
+            self.errors_in_outage = 0
+            self.want_diag = self.want_diag or "reconnect"
+        elif not self.ever_up:
+            log.info("link UP, robot %s, %s mode", self.base, self.mode)
+            self.want_diag = self.want_diag or "start"
+        self.ever_up = True
+        self.status.ok(latency)
+
+    def _link_error(self, e):
+        msg = str(e) if isinstance(e, ConnectionError) else describe_exc(e, self.base)
+        self.status.error(msg[:120])
+        now = time.monotonic()
+        if self.down_since is None:
+            self.down_since = now
+            self.errors_in_outage = 0
+            self.last_still_down_log = now
+            log.warning("link DOWN: %s", msg)
+        else:
+            log.debug("link error: %s", msg)
+            if now - self.last_still_down_log >= STILL_DOWN_LOG_S:
+                self.last_still_down_log = now
+                log.warning("link still DOWN after %.0f s (%d errors); last: %s",
+                            now - self.down_since, self.errors_in_outage, msg)
+        self.errors_in_outage += 1
+        if not isinstance(e, (ConnectionError, ValueError)):
+            log.error("unexpected error in the link thread", exc_info=e)
+
+    def _rediscover(self):
+        now = time.monotonic()
+        if now - self.last_discovery < REDISCOVER_AFTER_S:
+            return
+        self.last_discovery = now
+        current = self.base.split("//", 1)[-1]
+        hosts = [current] + [h for h in ROBOT_HOSTS if h != current]
+        for host in hosts:
+            if self._stop.is_set():
+                return
+            url = f"http://{host}"
+            try:
+                r = requests.get(url + "/api/telemetry", timeout=(0.5, 0.8))
+                fw = r.json().get("fw", "?")
+            except (requests.exceptions.RequestException, ValueError) as e:
+                log.debug("rediscovery: %s no answer (%s)", host, describe_exc(e))
+                continue
+            if url != self.base:
+                log.warning("robot found at %s (%s) - switching from %s", url, fw, self.base)
+                self.base = url
+                self.since = 0
+                self.boot = None
+            return
+        log.debug("rediscovery: robot not found at %s", ", ".join(hosts))
+
+    def _fetch_diag(self, session, why):
+        try:
+            r = self._get(session, "/api/diag")
+        except ConnectionError as e:
+            log.warning("could not read /api/diag after %s: %s", why, e)
+            return
+        if r.status_code == 404:
+            log.info("robot has no /api/diag (firmware older than 2.0)")
+            return
+        try:
+            d = r.json()
+        except ValueError:
+            log.warning("bad /api/diag reply: %r", r.text[:120])
+            return
+        if self.session_dir:
+            path = self.session_dir / f"diag_{datetime.now().strftime('%H%M%S')}_{why}.json"
+            path.write_text(json.dumps(d, indent=2))
+        boots = d.get("boots", [])
+        # Routine at start; worth shouting about after a reboot or outage.
+        lvl = logging.INFO if why == "start" else logging.WARNING
+        log.log(lvl, "robot diag (%s): fw %s, this boot reset reason %s, up %.0f s, "
+                    "min free heap %s B, slowest loop pass %.1f ms, Wi-Fi drops %s "
+                    "(last reason %s), WS clients %s",
+                    why, d.get("fw"), d.get("reset_reason"), d.get("uptime_ms", 0) / 1000,
+                    d.get("min_free_heap"), d.get("loop_max_us_boot", 0) / 1000,
+                    d.get("wifi_disconnects"), wifi_reason_name(d.get("wifi_last_reason")),
+                    d.get("ws_clients"))
+        for b in boots:
+            log.log(lvl, "  boot #%s reason %-12s fw %s; previous boot ran %.1f s; "
+                        "last events before that reset: %s",
+                        b.get("boot_no"), b.get("reason"), b.get("fw"),
+                        b.get("prev_boot_ran_ms", 0) / 1000,
+                        " | ".join(b.get("events_before_reset", [])[-6:]) or "-")
 
     def _put(self, sample):
         try:
             self.samples.put_nowait(sample)
         except queue.Full:
-            try:
-                self.samples.get_nowait()
-            except queue.Empty:
-                pass
-            self.samples.put_nowait(sample)
+            self.dropped_local += 1
+            if self.dropped_local in (1, 10, 100) or self.dropped_local % 1000 == 0:
+                log.error("mapper worker is not keeping up: %d samples dropped on the Mac",
+                          self.dropped_local)
+
+
+# Station disconnect reason codes (esp_wifi_types.h).
+WIFI_REASONS = {
+    1: "unspecified", 2: "auth expired", 3: "auth leave (AP kicked us)",
+    4: "assoc expired (idle)", 5: "AP too many clients", 6: "not authed",
+    7: "not associated", 8: "assoc leave", 15: "4-way handshake timeout (password?)",
+    23: "802.1x auth failed", 200: "beacon timeout (weak signal / AP gone)",
+    201: "no AP found (SSID / 2.4 GHz?)", 202: "auth fail (password)",
+    203: "assoc fail", 204: "handshake timeout", 205: "connection fail",
+    206: "AP TSF reset", 207: "roaming", 208: "assoc comeback too long",
+}
+
+
+def wifi_reason_name(code):
+    if code in (None, 0):
+        return "-"
+    return f"{code} {WIFI_REASONS.get(int(code), '')}".strip()
 
 
 # =============================================================================
@@ -932,8 +1295,8 @@ class Mapper:
         """Short human-readable reasons why the map is not updating."""
         w = []
         if link_state not in ("CONNECTED",):
-            w.append(f"NO TELEMETRY ({link_state}) - map frozen. "
-                     "Is the Mac still on BotController Wi-Fi?")
+            w.append(f"NO TELEMETRY ({link_state}) - map frozen. Robot on? Same Wi-Fi? "
+                     "(details in mapper.log)")
         s = self.last
         if s is not None:
             if not s.imu_ok:
@@ -1072,10 +1435,27 @@ def _render_png(mapper: Mapper, path):
 # Event types printed live in the terminal / map panel. RANGE, GYRO, STATS,
 # REQS and JOY are high-rate and only go to the CSV.
 LOUD_EVENTS = {"BOOT", "PREV_BOOT", "WATCHDOG", "ESTOP", "MODE", "GUARD", "AUTO",
-               "IMU", "WIFI", "LINKGAP", "MAC", "STALL"}
+               "IMU", "WIFI", "LINKGAP", "MAC", "STALL", "LINK"}
 ROBOT_LOG_FIELDS = ["mac_time_iso", "boot_id", "seq", "esp_ms", "type", "tag",
                     "a", "b", "f", "description"]
 NORMAL_STOP_SOURCES = {"phone", "mode_change", "boot", "speed_slider"}
+
+LINK_TEXT = {
+    "ws_open": "phone/client CONNECTED (WebSocket)",
+    "ws_close": "phone/client DISCONNECTED (WebSocket closed)",
+    "driver_changed": "a different client took over driving",
+    "phone_reconnected": "phone reconnected its WebSocket",
+    "phone_link_restored": "phone sees the link again",
+    "phone_rtt_spike": "phone measured a slow round trip",
+    "phone_page_hidden": "phone page hidden (screen lock / app switch)",
+    "cmd_queue_full": "command queue FULL - commands dropped",
+    "httpd_start_failed": "HTTP server FAILED to start",
+    "sample_ring_alloc_failed": "no memory for the sample ring",
+    "telemetry_overflow": "telemetry JSON overflowed its buffer",
+    "ws_silent_closed": "robot closed a SILENT client (phone gone / half-open link)",
+    "httpd_stalled": "robot HTTP server task STALLED",
+    "httpd_recovered": "robot HTTP server task running again",
+}
 
 
 def describe_event(etype, tag, a, b, f):
@@ -1103,7 +1483,8 @@ def describe_event(etype, tag, a, b, f):
     if t == "ESTOP":
         expl = {"estop_button": "STOP button pressed",
                 "estop_page_blur": "phone page lost focus (notification / app switch)",
-                "estop_page_hidden": "phone page hidden (screen lock / app switch)"}
+                "estop_page_hidden": "phone page hidden (screen lock / app switch)",
+                "estop_link_lost": "phone lost the link"}
         return f"{pre}EMERGENCY STOP: {expl.get(tag, tag)}" + (" (was AUTO)" if a else "")
     if t == "MODE":
         return f"{pre}mode -> {tag}"
@@ -1119,11 +1500,30 @@ def describe_event(etype, tag, a, b, f):
     if t == "IMU":
         return f"{pre}IMU: {tag.replace('_', ' ')} (a={a}, b={b}, value={f:.3f})"
     if t == "WIFI":
+        if tag == "sta_disconnected":
+            return (f"{pre}Wi-Fi DISCONNECTED from router: reason {wifi_reason_name(a)}, "
+                    f"drop #{b}, RSSI {f:.0f} dBm")
+        if tag == "sta_got_ip":
+            return f"{pre}Wi-Fi connected, got IP .{a}"
+        if tag in ("ap_join", "ap_leave"):
+            return f"{pre}Wi-Fi device {tag.replace('ap_', '')} (MAC ..{a:02x}), {b} connected"
         return f"{pre}Wi-Fi device {tag}: {a} connected"
     if t == "STATS":
-        return f"{pre}loop {a * 10} Hz, {b} Wi-Fi clients, free heap {f:.0f} B ({tag})"
+        return f"{pre}loop {a * 10} Hz, slowest pass {b} ms, free heap {f:.0f} B ({tag})"
     if t == "REQS":
-        return f"{pre}HTTP per second: drive {a}, telemetry {b}, other {f:.0f}"
+        return f"{pre}per second: WebSocket frames in {a} / out {f:.0f}, HTTP requests {b}"
+    if t == "LINK":
+        text = LINK_TEXT.get(tag, tag.replace("_", " "))
+        if tag in ("ws_open", "ws_close"):
+            return f"{pre}{text}: client .{a}, socket {b}, {f:.0f} open"
+        if tag in ("phone_rtt_spike",):
+            return f"{pre}{text}: {a} ms"
+        if tag in ("phone_reconnected", "phone_link_restored"):
+            return f"{pre}{text} (attempt {a})"
+        return f"{pre}{text} (a={a}, b={b})"
+    if t == "HEALTH":
+        return (f"{pre}health: min free heap {a} KB, loop stack free {b} B, "
+                f"server stack free {f:.0f} B")
     if t == "BOOT":
         return f"ROBOT BOOTED, reset reason: {tag}"
     if t == "PREV_BOOT":
@@ -1162,18 +1562,27 @@ def parse_log_response(text):
 
 
 class RobotLogClient:
-    """Continuously downloads /api/log into a CSV (everything the robot did)."""
+    """Continuously downloads /api/log into a CSV (everything the robot did).
 
-    def __init__(self, url, out_path, on_loud=None, period=ROBOT_LOG_POLL_S):
-        self.url = url
+    With `link` (a TelemetryClient) it follows the link's current robot
+    address, so it moves along when the robot is rediscovered elsewhere."""
+
+    def __init__(self, url, out_path, on_loud=None, period=ROBOT_LOG_POLL_S, link=None):
+        self._url = url
+        self.link = link
         self.out_path = Path(out_path)
         self.on_loud = on_loud
         self.period = period
         self.events = 0
         self.errors = 0
         self.lost = 0
+        self.beat = time.monotonic()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="robotlog", daemon=True)
+
+    @property
+    def url(self):
+        return self.link.base + "/api/log" if self.link else self._url
 
     def start(self):
         self._thread.start()
@@ -1182,6 +1591,8 @@ class RobotLogClient:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                log.error("robot-log thread did not stop within 3 s")
 
     def _note(self, w, boot, msg):
         self._write(w, boot, ("", "", "MAC", msg, 0, 0, 0.0))
@@ -1200,18 +1611,20 @@ class RobotLogClient:
 
     def _run(self):
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
-        session = requests.Session()
-        session.headers.update({"Connection": "close"})
-        since, boot, reachable, down_since = 0, None, None, None
+        session = requests.Session()   # keep-alive: one connection
+        since, boot, reachable, down_since, last_note = 0, None, None, None, 0.0
+        log.info("robot-log thread started -> %s", self.out_path)
         with open(self.out_path, "w", newline="") as f:
             f.write(f"# AUTOBOT robot event log, started {datetime.now().isoformat()}\n")
             f.write(f"# source: {self.url}\n")
             w = csv.writer(f)
             w.writerow(ROBOT_LOG_FIELDS)
             while not self._stop.is_set():
+                self.beat = time.monotonic()
                 more = False
+                url = self.url
                 try:
-                    r = session.get(self.url, params={"since": since},
+                    r = session.get(url, params={"since": since},
                                     timeout=(HTTP_CONNECT_TIMEOUT_S, 2.0))
                     if r.status_code == 404:
                         raise ValueError("robot firmware has no /api/log (upload v1.3+)")
@@ -1219,13 +1632,16 @@ class RobotLogClient:
                         raise ValueError(f"HTTP {r.status_code}")
                     hdr, rows = parse_log_response(r.text)
                     if "next" not in hdr:
-                        raise ValueError("bad log header")
+                        raise ValueError(f"bad log header: {r.text[:60]!r}")
                     if reachable is False:
                         gap = time.monotonic() - down_since
-                        self._note(w, boot, f"robot reachable again after {gap:.1f} s")
+                        self._note(w, boot, f"robot reachable again after {gap:.1f} s "
+                                            f"({self.errors} errors so far)")
                     reachable = True
                     if boot is not None and hdr.get("boot") != boot:
                         self._note(w, hdr.get("boot"), "robot REBOOTED - new log session")
+                        log.warning("robot log: robot rebooted (boot %s -> %s)",
+                                    boot, hdr.get("boot"))
                         boot, since = hdr.get("boot"), 0
                         continue
                     boot = hdr.get("boot")
@@ -1234,20 +1650,35 @@ class RobotLogClient:
                         self.lost += oldest - since
                         self._note(w, boot, f"LOST {oldest - since} events "
                                             "(Mac could not download them in time)")
+                        log.warning("robot log: %d events lost", oldest - since)
                     for row in rows:
                         self._write(w, boot, row)
                     nxt = int(hdr["next"])
                     more = hdr.get("more") == "1"
                     since = nxt
-                except (requests.exceptions.RequestException, ValueError) as e:
+                except Exception as e:   # anything: note it, back off, carry on
                     self.errors += 1
+                    msg = describe_exc(e, url)
+                    now = time.monotonic()
                     if reachable is not False:
-                        down_since = time.monotonic()
-                        self._note(w, boot, f"robot UNREACHABLE: {str(e)[:60]}")
+                        down_since = now
+                        last_note = now
+                        self._note(w, boot, f"robot UNREACHABLE: {msg}")
+                    elif now - last_note >= STILL_DOWN_LOG_S:
+                        last_note = now
+                        self._note(w, boot, f"robot still unreachable after "
+                                            f"{now - down_since:.0f} s: {msg}")
+                    log.debug("robot log: %s", msg)
+                    if not isinstance(e, (requests.exceptions.RequestException, ValueError)):
+                        log.error("unexpected error in the robot-log thread", exc_info=e)
                     reachable = False
+                    session.close()
+                    session = requests.Session()
                 f.flush()
-                if not more:
-                    self._stop.wait(self.period)
+                # Catching up a backlog: still leave the robot a short breather.
+                self._stop.wait(0.1 if more else self.period)
+        log.info("robot-log thread stopped: %d events, %d errors, %d lost",
+                 self.events, self.errors, self.lost)
 
 
 def read_robot_log(path):
@@ -1410,21 +1841,34 @@ def analyze_robot_log(path, make_plot=True):
         cut = sum(1 for r in stalls if r["b"])
         if cut:
             p(f"    dead-man cut the motors {cut} time(s)")
-    for name in ("WATCHDOG", "ESTOP", "GUARD", "AUTO", "IMU", "WIFI"):
+    for name in ("WATCHDOG", "ESTOP", "GUARD", "AUTO", "IMU", "WIFI", "LINK"):
         ev = by.get(name, [])
         if ev:
             counts = {}
             for r in ev:
                 counts[r["tag"]] = counts.get(r["tag"], 0) + 1
             p(f"  {name:8s} " + ", ".join(f"{k} x{v}" for k, v in counts.items()))
+    drops = [r for r in by.get("WIFI", []) if r["tag"] == "sta_disconnected"]
+    if drops:
+        reasons = {}
+        for r in drops:
+            k = wifi_reason_name(r["a"])
+            reasons[k] = reasons.get(k, 0) + 1
+        p("  Wi-Fi drops by reason: " + ", ".join(f"{k} x{v}" for k, v in reasons.items()))
     gaps = [r["a"] for r in by.get("LINKGAP", [])]
     if gaps:
         p(f"  phone command gaps while driving: {len(gaps)}, worst {max(gaps)} ms, "
-          f"over 700 ms (watchdog): {sum(g > 700 for g in gaps)}")
+          f"over 500 ms (watchdog): {sum(g > 500 for g in gaps)}")
     stats = by.get("STATS", [])
     if stats:
         p(f"  loop rate min {min(r['a'] for r in stats) * 10} Hz, "
+          f"slowest pass {max(r['b'] for r in stats)} ms, "
           f"free heap min {min(r['f'] for r in stats):.0f} B")
+    health = by.get("HEALTH", [])
+    if health:
+        p(f"  min free heap {min(r['a'] for r in health)} KB, "
+          f"stack free: loop {min(r['b'] for r in health)} B, "
+          f"server {min(r['f'] for r in health):.0f} B")
     macs = by.get("MAC", [])
     if macs:
         p(f"  Mac-side notes: {len(macs)}")
@@ -1442,14 +1886,15 @@ def analyze_robot_log(path, make_plot=True):
 
 
 def _plot_robot_log(rows, t0, png_path):
-    import matplotlib
-    if matplotlib.get_backend().lower() not in ("agg",) and "matplotlib.pyplot" not in sys.modules:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    # A bare Figure (Agg canvas): independent of pyplot and of whatever GUI
+    # backend the map window used.
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
     live = [r for r in rows if not r["type"].startswith("PREV:")]
     sel = lambda typ: [r for r in live if r["type"] == typ]
-    fig, ax = plt.subplots(4, 1, figsize=(16, 10), sharex=True,
-                           gridspec_kw={"height_ratios": [3, 2, 2, 1.4]})
+    fig = Figure(figsize=(16, 10))
+    FigureCanvasAgg(fig)
+    ax = fig.subplots(4, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2, 2, 1.4]})
     rng = sel("RANGE")
     ok = [r for r in rng if r["tag"] == "ok"]
     bad = [r for r in rng if r["tag"] != "ok"]
@@ -1488,7 +1933,7 @@ def _plot_robot_log(rows, t0, png_path):
 
     colors = {"STALL": "magenta", "WATCHDOG": "orange", "ESTOP": "red", "GUARD": "goldenrod", "AUTO": "purple",
               "IMU": "brown", "BOOT": "black", "WIFI": "teal", "MAC": "gray",
-              "LINKGAP": "pink"}
+              "LINKGAP": "pink", "LINK": "navy"}
     level = {k: i for i, k in enumerate(colors)}
     for r in live:
         if r["type"] in colors:
@@ -1502,26 +1947,30 @@ def _plot_robot_log(rows, t0, png_path):
     ax[0].set_title("AUTOBOT robot log timeline (vertical lines = events, see bottom row)")
     fig.tight_layout()
     fig.savefig(png_path, dpi=110)
-    plt.close(fig)
     return png_path
 
 
-def run_log_only(telemetry_url, log_url, rate):
+def run_log_only(telemetry_url, log_url, rate, session_dir):
     """Headless: record telemetry + robot log, print events, analyse at exit."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logdir = Path(OUTPUT_DIR) / "logs"
-    tel = TelemetryClient(telemetry_url, rate)
+    tel = TelemetryClient(telemetry_url, rate, session_dir=session_dir)
     mapper = Mapper()
-    worker = MapperWorker(mapper, tel, TelemetryRecorder(logdir / f"telemetry_{stamp}.jsonl"))
-    robot_log_path = logdir / f"robotlog_{stamp}.csv"
-    rl = RobotLogClient(log_url, robot_log_path,
-                        on_loud=lambda d: print(time.strftime("%H:%M:%S "), d))
+    worker = MapperWorker(mapper, tel, TelemetryRecorder(session_dir / "telemetry.jsonl"))
+    robot_log_path = session_dir / "robotlog.csv"
+
+    def loud(d):
+        print(time.strftime("%H:%M:%S "), d)
+        log.info("robot: %s", d)
+
+    rl = RobotLogClient(log_url, robot_log_path, on_loud=loud, link=tel)
+    wd = StallWatchdog({"mapper worker": lambda: worker.beat, "link": lambda: tel.beat,
+                        "robot log": lambda: rl.beat}, {"link": 10.0, "robot log": 10.0})
     keep_mac_awake()
-    print(f"Logging to {robot_log_path} and {logdir}/telemetry_{stamp}.jsonl")
+    print(f"Logging to {session_dir}/")
     print("Drive the robot normally. Press Ctrl-C to stop and get the report.\n")
     tel.start()
     worker.start()
     rl.start()
+    wd.start()
     try:
         while True:
             time.sleep(5)
@@ -1540,8 +1989,12 @@ def run_log_only(telemetry_url, log_url, rate):
         rl.stop()
         tel.stop()
         worker.stop()
+        wd.stop()
+    text = "LINK  " + tel.summary() + "\n" + analyze_robot_log(robot_log_path)
     print()
-    print(analyze_robot_log(robot_log_path))
+    print(text)
+    log.info("summary:\n%s", text)
+    (session_dir / "summary.txt").write_text(text + "\n")
 
 
 # =============================================================================
@@ -1654,7 +2107,9 @@ class SimulatedRobot:
             "left_cmd_int": round(self.l_int, 3), "right_cmd_int": round(self.r_int, 3),
             "throttle": 0, "steering": 0, "motor_speed": 180,
             "watchdog_stops": 0, "fwd_blocked": False, "auto_backoffs": 0,
-            "auto_reason": "none", "imu_resets": 0, "reset_reason": "power_on", "loop_hz": 50000,
+            "auto_reason": "none", "imu_resets": 0, "reset_reason": "power_on", "loop_hz": 1000,
+            "loop_max_us": 900, "ws_clients": 1, "sample_seq": int(self.t * 25),
+            "roll_deg": 0.0, "pitch_deg": 0.0,
             "home_ip": "", "home_rssi": 0, "free_heap": 200000,
         }
 
@@ -1705,11 +2160,17 @@ class TelemetryRecorder:
     def write(self, s: Telemetry):
         self.f.write(json.dumps({"wall": s.wall_time, "mono": s.recv_time,
                                  "lat": s.latency_s, "data": s.raw}) + "\n")
+        self.flush_if_due()
+
+    def flush_if_due(self):
+        """Called after every write AND by the worker when idle, so the file
+        is never more than ~1 s behind even if samples stop arriving."""
         if time.monotonic() - self.last_flush > 1.0:
             self.f.flush()
             self.last_flush = time.monotonic()
 
     def close(self):
+        self.f.flush()
         self.f.close()
 
 
@@ -1769,6 +2230,65 @@ class MapperWorker:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mapper", daemon=True)
         self.link_state = None
+        self.beat = time.monotonic()
+        self.errors = 0
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        if self._thread.is_alive():
+            # Closing the file under a running writer would only add errors.
+            log.error("mapper worker did not stop within 3 s - telemetry file left open")
+        elif self.recorder:
+            self.recorder.close()
+
+    def _run(self):
+        last_check = 0.0
+        while not self._stop.is_set():
+            self.beat = time.monotonic()
+            try:
+                s = self.source.samples.get(timeout=0.2)
+            except queue.Empty:
+                s = None
+                if self.recorder:
+                    self.recorder.flush_if_due()
+            if s is not None:
+                try:
+                    with self.mapper.lock:
+                        self.mapper.process(s)
+                    if self.recorder:
+                        self.recorder.write(s)
+                except Exception:
+                    self.errors += 1
+                    log.exception("mapper failed on sample millis=%s (worker continues)",
+                                  getattr(s, "millis", "?"))
+            if time.monotonic() - last_check > 0.5:
+                last_check = time.monotonic()
+                st = self.source.status.state()
+                if st["state"] != self.link_state:
+                    with self.mapper.lock:
+                        extra = f" ({st['last_error']})" if st["state"] != "CONNECTED" else ""
+                        self.mapper.log(f"link {st['state']}{extra}")
+                    log.info("link state %s%s", st["state"],
+                             f" ({st['last_error']})" if st["state"] != "CONNECTED" else "")
+                    self.link_state = st["state"]
+
+
+class StallWatchdog:
+    """Reports any thread that stops making progress: logs how long, and the
+    full stack of EVERY thread (that shows exactly where a deadlock sits)."""
+
+    def __init__(self, beats, limits=None):
+        self.beats = beats              # name -> callable returning a monotonic time
+        self.limits = limits or {}
+        self.stalled = {}
+        self.message = ""
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
 
     def start(self):
         self._thread.start()
@@ -1777,51 +2297,55 @@ class MapperWorker:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        if self.recorder:
-            self.recorder.close()
 
     def _run(self):
-        last_check = 0.0
-        while not self._stop.is_set():
+        while not self._stop.wait(1.0):
+            now = time.monotonic()
+            msgs = []
+            for name, get in self.beats.items():
+                age = now - get()
+                limit = self.limits.get(name, STALL_DUMP_AFTER_S)
+                if age > limit:
+                    msgs.append(f"{name} stalled {age:.0f} s")
+                    if name not in self.stalled:
+                        self.stalled[name] = now
+                        log.error("STALL: %s made no progress for %.1f s - stacks of all "
+                                  "threads follow", name, age)
+                        dump_all_stacks()
+                elif name in self.stalled:
+                    log.warning("%s recovered after a %.1f s stall", name,
+                                now - self.stalled.pop(name))
+            self.message = "; ".join(msgs)
+
+
+def dump_all_stacks():
+    names = {t.ident: t.name for t in threading.enumerate()}
+    for tid, frame in sys._current_frames().items():
+        log.error("--- thread %s ---\n%s", names.get(tid, tid),
+                  "".join(traceback.format_stack(frame)))
+
+
+def find_robot(hosts=ROBOT_HOSTS, attempts=2):
+    """Return the telemetry URL of the first host that answers, else None.
+    (The link keeps looking afterwards, so a miss here is not fatal.)"""
+    for attempt in range(attempts):
+        for host in hosts:
             try:
-                s = self.source.samples.get(timeout=0.2)
-            except queue.Empty:
-                s = None
-            if s is not None:
-                try:
-                    with self.mapper.lock:
-                        self.mapper.process(s)
-                    if self.recorder:
-                        self.recorder.write(s)
-                except Exception:
-                    traceback.print_exc()
-            if time.monotonic() - last_check > 0.5:
-                last_check = time.monotonic()
-                st = self.source.status.state()
-                if st["state"] != self.link_state:
-                    with self.mapper.lock:
-                        extra = f" ({st['last_error']})" if st["state"] != "CONNECTED" else ""
-                        self.mapper.log(f"link {st['state']}{extra}")
-                    self.link_state = st["state"]
-
-
-def find_robot(hosts=ROBOT_HOSTS):
-    """Return the telemetry URL of the first host that answers, else None."""
-    for host in hosts:
-        try:
-            ip = socket.gethostbyname(host)
-        except OSError:
-            print(f"  {host}: not found")
-            continue
-        url = f"http://{ip}/api/telemetry"
-        try:
-            r = requests.get(url, timeout=(1.0, 1.5), headers={"Connection": "close"})
-            obj = r.json()
-            print(f"  {host} -> {ip}: robot found ({obj.get('fw', '?')}, "
-                  f"home_ip {obj.get('home_ip') or '-'}, rssi {obj.get('home_rssi', '-')})")
-            return url
-        except (requests.exceptions.RequestException, ValueError):
-            print(f"  {host} -> {ip}: no answer")
+                ip = socket.gethostbyname(host)
+            except OSError:
+                print(f"  {host}: not found")
+                continue
+            url = f"http://{ip}/api/telemetry"
+            try:
+                r = requests.get(url, timeout=(1.0, 2.0))
+                obj = r.json()
+                print(f"  {host} -> {ip}: robot found ({obj.get('fw', '?')}, "
+                      f"home_ip {obj.get('home_ip') or '-'}, rssi {obj.get('home_rssi', '-')})")
+                log.info("discovery: robot at %s (%s)", ip, obj.get("fw", "?"))
+                return url
+            except (requests.exceptions.RequestException, ValueError) as e:
+                print(f"  {host} -> {ip}: no answer")
+                log.info("discovery: %s no answer (%s)", host, describe_exc(e))
     return None
 
 
@@ -1838,7 +2362,8 @@ def keep_mac_awake():
 # =============================================================================
 
 class MapperApp:
-    def __init__(self, source, source_desc, record_path=None, robot_log=None):
+    def __init__(self, source, source_desc, record_path=None, robot_log=None,
+                 session_dir=None):
         import matplotlib
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
@@ -1862,9 +2387,20 @@ class MapperApp:
         self.robot_log = None
         if robot_log:
             url, path = robot_log
-            self.robot_log = RobotLogClient(url, path, on_loud=self._robot_event)
+            link = source if isinstance(source, TelemetryClient) else None
+            self.robot_log = RobotLogClient(url, path, on_loud=self._robot_event, link=link)
             print(f"Recording robot event log to {path}")
+        self.session_dir = Path(session_dir) if session_dir else None
         self.closed = False
+        self.gui_beat = time.monotonic()
+        beats = {"mapper worker": lambda: self.worker.beat,
+                 "GUI": lambda: self.gui_beat}
+        limits = {"GUI": 10.0, "link": 10.0, "robot log": 10.0}
+        if hasattr(source, "beat"):
+            beats["link"] = lambda: source.beat
+        if self.robot_log:
+            beats["robot log"] = lambda: self.robot_log.beat
+        self.watchdog = StallWatchdog(beats, limits)
 
         self.fig = plt.figure(figsize=(13, 8))
         self.fig.canvas.manager.set_window_title("AUTOBOT mapper")
@@ -1929,43 +2465,70 @@ class MapperApp:
         self.worker.start()
         if self.robot_log:
             self.robot_log.start()
+        self.watchdog.start()
         self.timer.start()
         try:
             self.plt.show()
         except KeyboardInterrupt:
-            pass
+            log.info("Ctrl-C")
         finally:
             self.shutdown()
 
     def shutdown(self):
+        """Runs once, after the window is gone (never inside a GUI callback
+        and never holding mapper.lock): stop threads in order, then report."""
         if self.closed:
             return
         self.closed = True
+        t0 = time.monotonic()
+        log.info("shutting down")
         try:
             self.timer.stop()
         except Exception:
             pass
         self.source.stop()
-        self.worker.stop()
+        self.worker.stop()          # joins before closing the telemetry file
         if self.robot_log:
             self.robot_log.stop()
-            if self.robot_log.events:
-                print()
-                print(analyze_robot_log(self.robot_log.out_path))
+        self.watchdog.stop()
+        log.info("threads stopped in %.2f s", time.monotonic() - t0)
+
+        summary = []
+        if hasattr(self.source, "summary"):
+            summary.append("LINK  " + self.source.summary())
+        summary.append(f"MAPPER  worker errors {self.worker.errors}, samples "
+                       f"{self.mapper.counts.get('samples', 0)}")
+        if self.robot_log and self.robot_log.events:
+            summary.append(analyze_robot_log(self.robot_log.out_path))
+        text = "\n".join(summary)
+        print()
+        print(text)
+        log.info("summary:\n%s", text)
+        if self.session_dir:
+            (self.session_dir / "summary.txt").write_text(text + "\n")
         if AUTOSAVE_ON_EXIT and self.mapper.trajectory:
             print("Autosaved to", save_snapshot(self.mapper, None, OUTPUT_DIR, self.source_desc))
-        print("Mapper stopped. Telemetry thread joined.")
+        print("Mapper stopped." + (f" Logs: {self.session_dir}/" if self.session_dir else ""))
 
     def _robot_event(self, desc):
         with self.mapper.lock:
             self.mapper.log("robot: " + desc)
+        log.info("robot: %s", desc)
 
     def on_close(self, _event):
-        self.shutdown()
+        # Only stop drawing here; shutdown() runs after plt.show() returns.
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
 
     def on_key(self, event):
+        k = (event.key or "").lower()
+        if k in ("q", "escape"):
+            self.plt.close(self.fig)   # outside the lock: closing joins nothing now
+            return
         with self.mapper.lock:
-            self._handle_key((event.key or "").lower())
+            self._handle_key(k)
         self.redraw()
 
     def _handle_key(self, k):
@@ -1981,16 +2544,15 @@ class MapperApp:
                 self.mapper.log(f"saved {out}")
             except Exception as e:
                 self.mapper.log(f"SAVE FAILED: {e}")
-        elif k in ("q", "escape"):
-            self.plt.close(self.fig)
 
     def tick(self):
+        self.gui_beat = time.monotonic()
         if self.closed:
             return
         try:
             self.redraw()
         except Exception:
-            traceback.print_exc()
+            log.exception("redraw failed (GUI continues)")
 
     def redraw(self):
         with self.mapper.lock:
@@ -2041,6 +2603,8 @@ class MapperApp:
 
         self.info.set_text(self.status_text())
         warn = m.warnings(self.source.status.state()["state"])
+        if self.watchdog.message:
+            warn = warn + [f"STALL: {self.watchdog.message} (stacks in mapper.log)"]
         self.banner.set_text("\n".join(warn))
         self.banner.set_visible(bool(warn))
 
@@ -2056,6 +2620,10 @@ class MapperApp:
                   f"  ok {st['ok']}  err {st['errors']}  latency {lat}  age {age}"]
         if st["last_error"] and st["state"] != "CONNECTED":
             lines.append(f"  last error: {st['last_error'][:40]}")
+        if isinstance(self.source, TelemetryClient):
+            src = self.source
+            lines.append(f"  {src.mode or '-'}: rx {src.received}  lost {src.lost_samples}"
+                         f"  outages {len(src.outages)}  reboots {src.reboots}")
         lines.append("")
         if s is None:
             lines.append("waiting for first telemetry sample ...")
@@ -2147,13 +2715,38 @@ def run_selftest():
     if ino.exists():
         import re
         text = ino.read_text()
-        start = text.index("void handleTelemetry()")
+        start = text.index("void renderTelemetry()")
         body = text[start:text.index("FW_VERSION,", start)]   # the snprintf format only
         fw_keys = set(re.findall(r'\\"(\w+)\\":', body))
         check("firmware emits all REQUIRED_FIELDS", set(REQUIRED_FIELDS) <= fw_keys,
               str(sorted(set(REQUIRED_FIELDS) - fw_keys)))
         check("simulator JSON keys == firmware JSON keys", set(good) == fw_keys,
               f"only fw: {sorted(fw_keys - set(good))}, only sim: {sorted(set(good) - fw_keys)}")
+
+        # /api/samples: the firmware's column list must convert to a sample
+        # that parses exactly like the /api/telemetry JSON.
+        cstart = text.index('"#cols=')
+        cend = text.index('\\n"', cstart)
+        fw_cols = re.sub(r'"\s*"', "", text[cstart + 1:cend])[len("#cols="):].split(",")
+        row_vals = {"seq": "7", "millis": "123456", "mode": "M", "distance_cm": "87.5",
+                    "us_status": "ok", "us_seq": "42", "us_age_ms": "12", "imu_ok": "1",
+                    "yaw_unwrapped_deg": "370.5", "roll_deg": "1.00", "pitch_deg": "-2.00",
+                    "gyro_z_dps": "3.000", "gyro_z_raw_dps": "1.800", "gyro_bias_dps": "-1.2000",
+                    "gyro_cal": "ok", "left_cmd": "100", "right_cmd": "-100",
+                    "left_cmd_int": "12.500", "right_cmd_int": "-12.500"}
+        row = ",".join(row_vals.get(c, "?") for c in fw_cols)
+        obj = sample_row_to_dict(fw_cols, row, "99")
+        ps, perr = parse_telemetry(obj, now, time.time()) if obj else (None, "row not converted")
+        check("firmware /api/samples columns parse like telemetry",
+              ps is not None and abs(ps.yaw_deg - 10.5) < 1e-9 and ps.distance_m == 0.875
+              and ps.left_cmd_int == 12.5 and ps.boot_id == 99,
+              f"cols {fw_cols}" if ps is None else perr)
+        empty = dict(row_vals, distance_cm="", us_status="no_echo")
+        obj = sample_row_to_dict(fw_cols, ",".join(empty.get(c, "?") for c in fw_cols), "99")
+        ps, _ = parse_telemetry(obj, now, time.time())
+        check("sample without echo -> invalid range, not free",
+              ps is not None and ps.distance_m is None and ps.us_status == "no_echo")
+        check("short sample row rejected", sample_row_to_dict(fw_cols, "1,2,3", "1") is None)
     else:
         print("  [SKIP] firmware file not found for field comparison")
 
@@ -2261,6 +2854,10 @@ def run_selftest():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith(("/api/samples", "/api/diag")):   # pre-2.0 firmware
+                self.send_response(404)
+                self.end_headers()
+                return
             code, body = replies.popleft() if replies else ("200", json.dumps(good))
             self.send_response(int(code))
             self.send_header("Content-Type", "application/json")
@@ -2274,7 +2871,7 @@ def run_selftest():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     client = TelemetryClient(f"http://127.0.0.1:{srv.server_address[1]}/api/telemetry", 20)
     client.start()
-    time.sleep(1.5)
+    time.sleep(2.5)
     client.stop()
     srv.shutdown()
     st = client.status.state()
@@ -2432,8 +3029,10 @@ def run_selftest():
 def main():
     ap = argparse.ArgumentParser(description="AUTOBOT live 2D occupancy-grid mapper")
     ap.add_argument("--url", default=None,
-                    help="telemetry URL (default: try 192.168.1.200, then 192.168.4.1)")
-    ap.add_argument("--rate", type=float, default=POLL_HZ, help="poll rate in Hz (5-10)")
+                    help="robot address, e.g. http://192.168.1.200 "
+                         "(default: try 192.168.1.200, then 192.168.4.1)")
+    ap.add_argument("--rate", type=float, default=POLL_HZ,
+                    help="poll rate in Hz for pre-2.0 firmware (5-10)")
     ap.add_argument("--simulate", action="store_true", help="use a simulated robot")
     ap.add_argument("--selftest", action="store_true", help="run headless checks and exit")
     ap.add_argument("-v", action="store_true", help="verbose self-test")
@@ -2451,18 +3050,21 @@ def main():
         print(analyze_robot_log(args.analyze))
         return
 
-    if args.url is None and not (args.simulate or args.replay):
+    live = not (args.simulate or args.replay)
+    session_dir = start_session_logging("log-only" if args.log_only else "map") if live else None
+    if args.url is None and live:
         print("Looking for the robot ...")
         args.url = find_robot()
         if args.url is None:
             args.url = TELEMETRY_URL
-            print(f"Robot not found yet - will keep trying {args.url}.\n"
+            print(f"Robot not found yet - will keep looking ({', '.join(ROBOT_HOSTS)}).\n"
                   "Is the robot on, and is this Mac on the same Wi-Fi "
                   "(home network or BotController)?")
+            log.warning("robot not found at start; the link keeps searching %s", ROBOT_HOSTS)
     args.url = args.url or TELEMETRY_URL
-    log_url = args.url.rsplit("/api/", 1)[0] + "/api/log"
+    log_url = base_url(args.url) + "/api/log"
     if args.log_only:
-        run_log_only(args.url, log_url, min(10.0, max(1.0, args.rate)))
+        run_log_only(args.url, log_url, min(10.0, max(1.0, args.rate)), session_dir)
         return
 
     rate = min(10.0, max(1.0, args.rate))
@@ -2473,18 +3075,16 @@ def main():
     elif args.simulate:
         source, desc = SimulatedSource(rate), "SIMULATOR (no hardware)"
     else:
-        source, desc = TelemetryClient(args.url, rate), args.url
+        source, desc = TelemetryClient(args.url, rate, session_dir=session_dir), base_url(args.url)
         if RECORD_TELEMETRY and not args.no_record:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            record = Path(OUTPUT_DIR) / "logs" / f"telemetry_{stamp}.jsonl"
+            record = session_dir / "telemetry.jsonl"
         if ROBOT_LOG and not args.no_record:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            robot_log = (log_url, Path(OUTPUT_DIR) / "logs" / f"robotlog_{stamp}.csv")
+            robot_log = (log_url, session_dir / "robotlog.csv")
     if not args.replay:
         keep_mac_awake()
-    print(f"AUTOBOT mapper - source: {desc} @ {rate:.0f} Hz")
+    print(f"AUTOBOT mapper - source: {desc}")
     print("Keys in the map window: space/p pause, r reset, s save, q quit")
-    MapperApp(source, desc, record, robot_log).run()
+    MapperApp(source, desc, record, robot_log, session_dir).run()
 
 
 if __name__ == "__main__":
